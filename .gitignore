@@ -1,0 +1,48 @@
+# ROS2 build outputs
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Datasets and large model files
+datasets/raw/
+datasets/*.zip
+datasets/**/*.zip
+*.pt
+*.pth
+*.onnx
+*.engine
+*.hef
+*.tflite
+*.weights
+
+# Logs and outputs
+*.log
+logs/
+outputs/
+runs/
+
+# Secrets
+.env
+*.pem
+*.key
+*.token
+secrets/

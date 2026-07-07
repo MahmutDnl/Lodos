@@ -1,0 +1,17 @@
+Önce AGENTS.md, PROJECT_CONTEXT.md, TASKS.md ve docs/ klasöründeki dosyaları oku.
+
+Bu proje TEKNOFEST 2026 İnsansız Deniz Aracı Yarışması için LODOS takımının Albatros adlı ROS2 tabanlı İDA yazılım çalışma alanıdır.
+
+Lütfen şu kurallarla ilerle:
+
+1. Terminal komutu çalıştırmadan önce benden onay iste.
+2. Hiçbir dosyayı silme.
+3. Önce mevcut klasör yapısını oku.
+4. Sonra ne yapacağını madde madde planla.
+5. Hangi dosyaları oluşturacağını/değiştireceğini söyle.
+6. Ubuntu 24.04 kullandığım için ROS2 Jazzy varsay.
+7. Gerçek araç bağlıyken arm/disarm, motor komutu veya mode değiştirme çalıştırma.
+8. İlk hedefimiz sağlam bir ROS2 iskeleti kurmak: lodos_mission_manager, lodos_perception, lodos_mavros_control, lodos_obstacle_avoidance ve lodos_launch.
+
+İlk görev:
+Mevcut workspace'i incele. src klasörü var mı kontrol et. Sonra lodos_mission_manager adlı basit bir ament_python ROS2 paketi oluşturmak için plan çıkar. Komutu çalıştırmadan önce benden onay iste.
