@@ -298,6 +298,41 @@ Kullanılacak MAVROS servisleri:
 - `/mavros/cmd/arming`
 - `/mavros/set_mode`
 
+Subscribe eder:
+
+- Topic: `/mavros/state`
+- Type: `mavros_msgs/msg/State`
+
+- Topic: `/mavros/global_position/global`
+- Type: `sensor_msgs/msg/NavSatFix`
+
+- Topic: `/mavros/imu/data`
+- Type: `sensor_msgs/msg/Imu`
+
+- Topic: `/mavros/battery`
+- Type: `sensor_msgs/msg/BatteryState`
+
+Publish eder:
+
+- Topic: `/albatros/mavros/status`
+- Type: `std_msgs/msg/String`
+
+Status JSON alanları:
+
+- `connected` — MAVROS bağlantı durumu (`/mavros/state.connected`)
+- `armed` — Pixhawk arm durumu
+- `mode` — Pixhawk uçuş modu (örn. `"GUIDED"`)
+- `state_ok` — `/mavros/state` son `connection_timeout_sec` içinde geldi mi
+- `gps_ok` — `/mavros/global_position/global` son timeout içinde geldi mi
+- `imu_ok` — `/mavros/imu/data` son timeout içinde geldi mi
+- `battery_ok` — `/mavros/battery` son timeout içinde geldi mi
+- `arming_service_available` — `/mavros/cmd/arming` servisi hazır mı
+- `set_mode_service_available` — `/mavros/set_mode` servisi hazır mı
+- `last_state_age_sec` — Son `/mavros/state` mesajının yaşı (saniye, None: hiç gelmedi)
+- `last_gps_age_sec` — Son GPS mesajının yaşı
+- `last_imu_age_sec` — Son IMU mesajının yaşı
+- `last_battery_age_sec` — Son batarya mesajının yaşı
+
 Notlar:
 
 - MAVROS hazır ROS2-MAVLink köprüsüdür.
