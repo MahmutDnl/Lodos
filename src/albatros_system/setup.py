@@ -27,6 +27,7 @@ setup(
             'camera_node = albatros_system.camera_node:main',
             'yolo_node = albatros_system.yolo_node:main',
             'mavros_node = albatros_system.mavros_node:main',
+            'imu_sensor_node = albatros_system.imu_sensor_node:main',
         ],
     },
 )
