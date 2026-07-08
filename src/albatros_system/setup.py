@@ -28,6 +28,7 @@ setup(
             'yolo_node = albatros_system.yolo_node:main',
             'mavros_node = albatros_system.mavros_node:main',
             'imu_sensor_node = albatros_system.imu_sensor_node:main',
+            'gps_sensor_node = albatros_system.gps_sensor_node:main',
         ],
     },
 )
