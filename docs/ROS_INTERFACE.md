@@ -1,6 +1,13 @@
 # LODOS Albatros ROS2 Interface
 
-Bu dosya LODOS Albatros ROS2 projesinin ortak haberleşme sözleşmesidir.
+Bu dosya LODOS Albatros ROS2 projesinin ortak node ve topic sözleşmesidir.
+
+Bu projede tek ROS2 paketi kullanılacaktır:
+
+- Paket adı: `albatros_system`
+- Node dosyalarının yolu: `src/albatros_system/albatros_system/`
+
+Yeni ROS2 paketi oluşturulmayacaktır.
 
 Bu dosyadaki node isimleri, topic isimleri ve mesaj tipleri ekip tarafından değiştirilmemelidir.
 
@@ -8,86 +15,117 @@ Her geliştirici ve her AI aracı önce bu dosyayı okumalıdır.
 
 ---
 
-# 1. Paket Yapısı
+# 1. Kullanılacak Node Listesi
 
-Ana yazılım node'ları mevcut pakette kalacaktır:
-
-- Paket adı: `albatros_system`
-- Node dosyalarının yolu: `src/albatros_system/albatros_system/`
-
-Custom mesajlar için ayrı bir interface paketi kullanılacaktır:
-
-- Interface paket adı: `albatros_interfaces`
-- Interface paket yolu: `src/albatros_interfaces/`
-
-`albatros_interfaces` paketi yalnızca `.msg` dosyaları içerecektir. Bu paket içinde node yazılmayacaktır.
-
----
-
-# 2. Node Listesi
-
-Kullanılacak node dosyaları:
+Projede yalnızca aşağıdaki node dosyaları kullanılacaktır:
 
 - `kamera_node.py`
 - `yolo_node.py`
-- `mesafe_sensor_node.py`
-- `gps_node.py`
-- `imu_node.py`
+- `imu_sensor_node.py`
+- `gps_sensor_node.py`
 - `state_node.py`
+- `mavros_node.py`
 - `costmap_node.py`
 - `gorev_node.py`
-- `karar_node.py`
 - `komut_node.py`
-- `data_logger_node.py`
+- `karar_node.py`
 
-MAVROS ayrı bir takım node'u olarak yazılmayacaktır. MAVROS hazır ROS2-MAVLink köprüsü olarak kullanılacaktır.
+Ekstra node oluşturulmayacaktır.
 
-- `gps_node.py` MAVROS GPS topicini okuyacaktır.
-- `imu_node.py` MAVROS IMU topicini okuyacaktır.
-- `state_node.py` GPS, IMU, MAVROS state ve batarya verilerini birleştirecektir.
-- `komut_node.py` MAVROS topic ve servislerine komut gönderecektir.
+Kullanılmayacak yapılar:
 
----
+- `data_logger_node.py` kullanılmayacak.
+- `mesafe_sensor_node.py` kullanılmayacak.
+- `albatros_interfaces` gibi ayrı interface paketi oluşturulmayacak.
+- Custom `.msg` paketi şimdilik oluşturulmayacak.
 
-# 3. Custom Mesajlar
-
-Custom mesajlar `albatros_interfaces` paketi içinde tanımlanacaktır.
-
-Oluşturulacak mesajlar:
-
-- `Detection.msg`
-- `DetectionArray.msg`
-- `VehicleState.msg`
-- `Obstacle.msg`
-- `ObstacleArray.msg`
-- `MissionStatus.msg`
-
-Tüm custom mesajlarda zaman bilgisi için `std_msgs/Header header` alanı kullanılmalıdır.
+Tahtadaki mimari esas alınmıştır.
 
 ---
 
-# 4. Kamera Node
+# 2. Yazılım İsterleri
+
+Yarışma sonunda üretilecek / kaydedilecek temel yazılım çıktıları:
+
+1. Costmap / engel haritası
+2. YOLO işlenmiş kamera videosu
+3. Araç telemetri verisi
+
+Bu çıktılar ayrı bir data logger node ile değil, mevcut node'ların ürettiği veriler üzerinden alınacaktır.
+
+---
+
+# 3. Kamera Node
 
 Dosya adı:
 
 - `kamera_node.py`
+
+Node adı:
+
+- `camera_node`
+
+Görevi:
+
+- Kameradan ham görüntü almak.
+- Görüntüyü ROS2 topic'i olarak yayınlamak.
+- YOLO node'unun kullanacağı ham kamera verisini üretmek.
+
+Kamera node içinde kullanılan parametreler:
+
+- `camera_index`
+- `frame_width`
+- `frame_height`
+- `fps`
+
+Varsayılan değerler:
+
+- `camera_index`: `0`
+- `frame_width`: `640`
+- `frame_height`: `480`
+- `fps`: `30.0`
 
 Publish eder:
 
 - Topic: `/albatros/kamera/image_raw`
 - Type: `sensor_msgs/msg/Image`
 
-Açıklama:
+Mesaj bilgileri:
 
-Kameradan ham görüntü alır ve ROS2 topicine yayınlar.
+- Encoding: `bgr8`
+- Header stamp: ROS zamanı ile doldurulur.
+- Frame ID: `camera_frame`
+
+Kamera node davranışı:
+
+- OpenCV ile kamera açılır.
+- `cv2.VideoCapture(camera_index)` kullanılır.
+- Görüntü boyutu ve FPS parametrelerden alınır.
+- Görüntü `cv_bridge` ile `sensor_msgs/msg/Image` formatına çevrilir.
+- Görüntü sağ-sol terslik için `cv2.flip(frame, 1)` ile çevrilir.
+- Kamera açılamazsa hata mesajı verilir.
+- Kameradan frame alınamazsa uyarı mesajı verilir.
+
+Kamera node içinde publisher topic'i kesinlikle şu olmalıdır:
+
+- `/albatros/kamera/image_raw`
+
+Eski topic olan `/camera/image_raw` kullanılmayacaktır.
 
 ---
 
-# 5. YOLO Node
+# 4. YOLO Node
 
 Dosya adı:
 
 - `yolo_node.py`
+
+Görevi:
+
+- Kamera node'dan gelen ham görüntüyü almak.
+- YOLO modeli ile duba, hedef ve engel tespiti yapmak.
+- Tespit sonuçlarını yayınlamak.
+- İşlenmiş kamera görüntüsünü yayınlamak.
 
 Subscribe eder:
 
@@ -97,94 +135,92 @@ Subscribe eder:
 Publish eder:
 
 - Topic: `/albatros/yolo/tespitler`
-- Type: `albatros_interfaces/msg/DetectionArray`
+- Type: `std_msgs/msg/String`
 
-- Topic: `/albatros/kamera/annotated`
+- Topic: `/albatros/kamera/processed`
 - Type: `sensor_msgs/msg/Image`
 
-Açıklama:
+Tespit formatı:
 
-Kamera görüntüsünü işler. YOLO modeli ile duba, engel ve hedef tespiti yapar.
+`/albatros/yolo/tespitler` topic'i geçici olarak `std_msgs/msg/String` ile JSON benzeri metin formatında yayınlanabilir.
 
-JSON kullanılmayacaktır. Tespitler custom mesaj ile yayınlanacaktır.
+Örnek içerik:
 
----
+{
+  "detections": [
+    {
+      "class": "sari_duba",
+      "confidence": 0.86,
+      "bbox": [120, 50, 200, 180]
+    }
+  ]
+}
 
-# 6. Mesafe Sensör Node
+Notlar:
 
-Dosya adı:
-
-- `mesafe_sensor_node.py`
-
-Publish eder:
-
-- Topic: `/albatros/mesafe/front`
-- Type: `sensor_msgs/msg/Range`
-
-- Topic: `/albatros/mesafe/left`
-- Type: `sensor_msgs/msg/Range`
-
-- Topic: `/albatros/mesafe/right`
-- Type: `sensor_msgs/msg/Range`
-
-- Topic: `/albatros/mesafe/back`
-- Type: `sensor_msgs/msg/Range`
-
-Açıklama:
-
-Ultrasonik mesafe sensörlerinden gelen verileri yayınlar.
+- `/albatros/kamera/processed` yarışma sonunda istenen işlenmiş kamera videosu için kullanılacaktır.
+- YOLO node doğrudan karar vermez.
+- YOLO node sadece algılama sonucunu üretir.
 
 ---
 
-# 7. GPS Node
+# 5. IMU Sensör Node
 
 Dosya adı:
 
-- `gps_node.py`
+- `imu_sensor_node.py`
 
-Subscribe eder:
+Görevi:
 
-- Topic: `/mavros/global_position/global`
-- Type: `sensor_msgs/msg/NavSatFix`
-
-Publish eder:
-
-- Topic: `/albatros/gps/fix`
-- Type: `sensor_msgs/msg/NavSatFix`
-
-Açıklama:
-
-MAVROS üzerinden gelen GPS bilgisini alır ve sistem içi standart GPS topicine aktarır.
-
----
-
-# 8. IMU Node
-
-Dosya adı:
-
-- `imu_node.py`
-
-Subscribe eder:
-
-- Topic: `/mavros/imu/data`
-- Type: `sensor_msgs/msg/Imu`
+- IMU verisini almak.
+- State node'un kullanacağı IMU topic'ini yayınlamak.
 
 Publish eder:
 
 - Topic: `/albatros/imu/data`
 - Type: `sensor_msgs/msg/Imu`
 
-Açıklama:
+Notlar:
 
-MAVROS üzerinden gelen IMU bilgisini alır ve sistem içi standart IMU topicine aktarır.
+- IMU verisi doğrudan sensörden veya MAVROS üzerinden alınabilir.
+- Sistemin diğer node'ları IMU verisini bu standart topic üzerinden okuyacaktır.
 
 ---
 
-# 9. State Node
+# 6. GPS Sensör Node
+
+Dosya adı:
+
+- `gps_sensor_node.py`
+
+Görevi:
+
+- GPS verisini almak.
+- State node'un kullanacağı GPS topic'ini yayınlamak.
+
+Publish eder:
+
+- Topic: `/albatros/gps/fix`
+- Type: `sensor_msgs/msg/NavSatFix`
+
+Notlar:
+
+- GPS verisi doğrudan GPS modülünden veya MAVROS üzerinden alınabilir.
+- Sistemin diğer node'ları GPS verisini bu standart topic üzerinden okuyacaktır.
+
+---
+
+# 7. State Node
 
 Dosya adı:
 
 - `state_node.py`
+
+Görevi:
+
+- GPS, IMU ve MAVROS üzerinden gelen araç durum bilgilerini toplamak.
+- Aracın genel durumunu yayınlamak.
+- Araç telemetri verisi için temel state bilgisini oluşturmak.
 
 Subscribe eder:
 
@@ -203,61 +239,118 @@ Subscribe eder:
 Publish eder:
 
 - Topic: `/albatros/state`
-- Type: `albatros_interfaces/msg/VehicleState`
+- Type: `std_msgs/msg/String`
 
-Açıklama:
+State içeriği:
 
-Aracın genel durumunu toplar. GPS, IMU, mod, arm bilgisi, batarya ve yönelim verilerini tek bir araç durumu mesajı haline getirir.
+`/albatros/state` topic'i araç durumunu taşıyacaktır.
+
+İçermesi beklenen bilgiler:
+
+- Araç modu
+- Arm / disarm durumu
+- GPS latitude
+- GPS longitude
+- Heading / yönelim
+- Batarya durumu
+- IMU'dan gelen temel yönelim bilgisi
+
+Örnek içerik:
+
+{
+  "mode": "GUIDED",
+  "armed": false,
+  "lat": 40.123456,
+  "lon": 29.123456,
+  "heading": 90.0,
+  "battery": 12.1
+}
+
+Notlar:
+
+- Araç telemetri verisi için temel kaynak `state_node.py` olacaktır.
+- Daha sonra ihtiyaç olursa bu veri CSV formatında kaydedilebilir.
 
 ---
 
-# 10. Costmap Node
+# 8. MAVROS Node
+
+Dosya adı:
+
+- `mavros_node.py`
+
+Görevi:
+
+- MAVROS ile Pixhawk bağlantısını sistem içinde takip etmek.
+- MAVROS topic ve servislerinin kullanımını düzenlemek.
+- MAVROS bağlantısının çalıştığını kontrol etmek.
+
+Kullanılacak MAVROS topicleri:
+
+- `/mavros/state`
+- `/mavros/global_position/global`
+- `/mavros/imu/data`
+- `/mavros/battery`
+- `/mavros/setpoint_velocity/cmd_vel_unstamped`
+
+Kullanılacak MAVROS servisleri:
+
+- `/mavros/cmd/arming`
+- `/mavros/set_mode`
+
+Notlar:
+
+- MAVROS hazır ROS2-MAVLink köprüsüdür.
+- Pixhawk ile gerçek haberleşmeyi MAVROS sağlar.
+- `mavros_node.py`, MAVROS'un kendisini yeniden yazmaz.
+- Gerekirse bağlantı kontrolü, durum kontrolü veya yardımcı köprü mantığı için kullanılır.
+- Pixhawk'a gidecek son hareket komutları `komut_node.py` üzerinden gönderilecektir.
+
+---
+
+# 9. Costmap Node
 
 Dosya adı:
 
 - `costmap_node.py`
 
+Görevi:
+
+- YOLO tespitleri ve araç state bilgisini kullanarak costmap / engel haritası oluşturmak.
+- Yarışma sonunda istenen costmap çıktısını üretmek.
+
 Subscribe eder:
 
 - Topic: `/albatros/yolo/tespitler`
-- Type: `albatros_interfaces/msg/DetectionArray`
-
-- Topic: `/albatros/mesafe/front`
-- Type: `sensor_msgs/msg/Range`
-
-- Topic: `/albatros/mesafe/left`
-- Type: `sensor_msgs/msg/Range`
-
-- Topic: `/albatros/mesafe/right`
-- Type: `sensor_msgs/msg/Range`
-
-- Topic: `/albatros/mesafe/back`
-- Type: `sensor_msgs/msg/Range`
+- Type: `std_msgs/msg/String`
 
 - Topic: `/albatros/state`
-- Type: `albatros_interfaces/msg/VehicleState`
+- Type: `std_msgs/msg/String`
 
 Publish eder:
 
 - Topic: `/albatros/costmap`
 - Type: `nav_msgs/msg/OccupancyGrid`
 
-- Topic: `/albatros/engeller`
-- Type: `albatros_interfaces/msg/ObstacleArray`
+Notlar:
 
-Açıklama:
-
-YOLO tespitleri, mesafe sensörleri ve araç durumunu kullanarak lokal engel haritası üretir.
-
-JSON kullanılmayacaktır. Costmap için `nav_msgs/msg/OccupancyGrid` kullanılacaktır.
+- Costmap, engel haritası olarak kullanılacaktır.
+- İlk aşamada basit bir lokal harita mantığıyla başlanabilir.
+- Daha sonra gerçek koordinat dönüşümleri ve detaylı engel konumlandırma eklenebilir.
 
 ---
 
-# 11. Görev Node
+# 10. Görev / Mission Node
 
 Dosya adı:
 
 - `gorev_node.py`
+
+Görevi:
+
+- Görev akışını yönetmek.
+- Parkur-1, Parkur-2 ve Parkur-3 geçişlerini kontrol etmek.
+- Görev başlangıç, görev bitiş ve acil durdurma durumlarını yönetmek.
 
 Görev durumları:
 
@@ -278,21 +371,15 @@ Subscribe eder:
 - Type: `std_msgs/msg/String`
 
 - Topic: `/albatros/state`
-- Type: `albatros_interfaces/msg/VehicleState`
+- Type: `std_msgs/msg/String`
 
 - Topic: `/albatros/costmap`
 - Type: `nav_msgs/msg/OccupancyGrid`
 
-- Topic: `/albatros/engeller`
-- Type: `albatros_interfaces/msg/ObstacleArray`
-
-- Topic: `/albatros/yolo/tespitler`
-- Type: `albatros_interfaces/msg/DetectionArray`
-
 Publish eder:
 
-- Topic: `/albatros/gorev/status`
-- Type: `albatros_interfaces/msg/MissionStatus`
+- Topic: `/albatros/gorev/state`
+- Type: `std_msgs/msg/String`
 
 - Topic: `/albatros/gorev/current_goal`
 - Type: `sensor_msgs/msg/NavSatFix`
@@ -302,10 +389,6 @@ Publish eder:
 
 - Topic: `/albatros/emergency_stop`
 - Type: `std_msgs/msg/Bool`
-
-Açıklama:
-
-Parkur-1, Parkur-2 ve Parkur-3 görev akışını yönetir. Parkurlar arası geçiş kullanıcı müdahalesi olmadan otomatik yapılmalıdır.
 
 Start komutu:
 
@@ -315,18 +398,29 @@ Stop komutu:
 
 - `ros2 topic pub --once /albatros/gorev/stop std_msgs/msg/String "{data: 'STOP'}"`
 
+Notlar:
+
+- Parkurlar arası geçiş kullanıcı müdahalesi olmadan otomatik yapılmalıdır.
+- Görev node karar node'a doğrudan hız komutu göndermez.
+- Görev node sadece görev durumunu ve hedef bilgisini yönetir.
+
 ---
 
-# 12. Karar Node
+# 11. Karar Node
 
 Dosya adı:
 
 - `karar_node.py`
 
+Görevi:
+
+- Görev durumuna, costmap'e, YOLO tespitlerine ve araç state bilgisine göre aracın ne yapacağına karar vermek.
+- Komut node'a hareket kararı üretmek.
+
 Subscribe eder:
 
-- Topic: `/albatros/gorev/status`
-- Type: `albatros_interfaces/msg/MissionStatus`
+- Topic: `/albatros/gorev/state`
+- Type: `std_msgs/msg/String`
 
 - Topic: `/albatros/gorev/current_goal`
 - Type: `sensor_msgs/msg/NavSatFix`
@@ -335,146 +429,73 @@ Subscribe eder:
 - Type: `std_msgs/msg/String`
 
 - Topic: `/albatros/state`
-- Type: `albatros_interfaces/msg/VehicleState`
+- Type: `std_msgs/msg/String`
 
 - Topic: `/albatros/costmap`
 - Type: `nav_msgs/msg/OccupancyGrid`
 
-- Topic: `/albatros/engeller`
-- Type: `albatros_interfaces/msg/ObstacleArray`
-
 - Topic: `/albatros/yolo/tespitler`
-- Type: `albatros_interfaces/msg/DetectionArray`
+- Type: `std_msgs/msg/String`
 
 Publish eder:
 
 - Topic: `/albatros/karar/cmd_vel`
-- Type: `geometry_msgs/msg/TwistStamped`
+- Type: `geometry_msgs/msg/Twist`
 
-- Topic: `/albatros/karar/global_setpoint`
-- Type: `mavros_msgs/msg/GlobalPositionTarget`
+Notlar:
 
-Açıklama:
-
-Aracın nasıl hareket edeceğine karar verir.
-
-`/albatros/karar/cmd_vel` lokal manevra, engelden kaçma ve kısa süreli hız komutları için kullanılır.
-
-`/albatros/karar/global_setpoint` GPS hedefe yönelme ve waypoint mantığı için kullanılır.
-
-Sadece `Twist` kullanmak yeterli değildir. Hem hız komutu hem global hedef komutu mimaride bulunmalıdır.
+- Karar node doğrudan Pixhawk'a komut göndermez.
+- Sadece komut node'a hareket kararı üretir.
+- Engelden kaçma, hedefe yönelme, duba ortalama gibi kararlar bu node içinde verilir.
 
 ---
 
-# 13. Komut Node
+# 12. Komut Node
 
 Dosya adı:
 
 - `komut_node.py`
 
+Görevi:
+
+- Karar node'dan gelen hareket komutunu almak.
+- Güvenlik kontrolünden geçirmek.
+- MAVROS üzerinden Pixhawk'a iletmek.
+
 Subscribe eder:
 
 - Topic: `/albatros/karar/cmd_vel`
-- Type: `geometry_msgs/msg/TwistStamped`
+- Type: `geometry_msgs/msg/Twist`
 
-- Topic: `/albatros/karar/global_setpoint`
-- Type: `mavros_msgs/msg/GlobalPositionTarget`
-
-- Topic: `/albatros/gorev/status`
-- Type: `albatros_interfaces/msg/MissionStatus`
+- Topic: `/albatros/gorev/state`
+- Type: `std_msgs/msg/String`
 
 - Topic: `/albatros/emergency_stop`
 - Type: `std_msgs/msg/Bool`
 
 MAVROS'a gönderir:
 
-- Topic: `/mavros/setpoint_velocity/cmd_vel`
-- Type: `geometry_msgs/msg/TwistStamped`
-
-- Topic: `/mavros/setpoint_raw/global`
-- Type: `mavros_msgs/msg/GlobalPositionTarget`
-
-MAVROS servisleri:
-
-- `/mavros/cmd/arming`
-- `/mavros/set_mode`
+- Topic: `/mavros/setpoint_velocity/cmd_vel_unstamped`
+- Type: `geometry_msgs/msg/Twist`
 
 Güvenlik kuralları:
 
-- `/albatros/emergency_stop` değeri `true` olursa motor komutu sıfırlanmalıdır.
-- Görev durumu `EMERGENCY_STOP` olursa motor komutu sıfırlanmalıdır.
-- `karar_node.py` üzerinden 0.5 saniye boyunca yeni komut gelmezse motor komutu sıfırlanmalıdır.
-- Gerekirse araç HOLD moduna alınmalıdır.
-- Bu watchdog mekanizması `komut_node.py` içinde bulunmalıdır.
+- `/albatros/emergency_stop` true olursa motor komutu sıfırlanacaktır.
+- Görev durumu `EMERGENCY_STOP` olursa motor komutu sıfırlanacaktır.
+- Karar node'dan belirli süre yeni komut gelmezse motor komutu sıfırlanacaktır.
+- Pixhawk'a gönderilecek son komut bu node üzerinden geçmelidir.
 
 ---
 
-# 14. Data Logger Node
-
-Dosya adı:
-
-- `data_logger_node.py`
-
-Subscribe eder:
-
-- Topic: `/albatros/kamera/annotated`
-- Type: `sensor_msgs/msg/Image`
-
-- Topic: `/albatros/state`
-- Type: `albatros_interfaces/msg/VehicleState`
-
-- Topic: `/albatros/costmap`
-- Type: `nav_msgs/msg/OccupancyGrid`
-
-- Topic: `/albatros/karar/cmd_vel`
-- Type: `geometry_msgs/msg/TwistStamped`
-
-- Topic: `/albatros/karar/global_setpoint`
-- Type: `mavros_msgs/msg/GlobalPositionTarget`
-
-- Topic: `/albatros/gorev/status`
-- Type: `albatros_interfaces/msg/MissionStatus`
-
-Açıklama:
-
-Yarışma sonunda teslim edilecek verileri kaydeder.
-
-Kaydedilecek veriler:
-
-- İşlenmiş kamera görüntüsü
-- Araç telemetri verisi
-- Hız setpoint bilgisi
-- Yön setpoint bilgisi
-- Lokal harita / costmap / engel haritası
-- Görev durumu
-
----
-
-# 15. Genel Haberleşme Kuralları
-
-Yüksek frekanslı topiclerde `std_msgs/msg/String` ve JSON kullanılmayacaktır.
-
-JSON yalnızca debug, geçici test veya insan tarafından okunacak log çıktıları için kullanılabilir.
-
-Ana haberleşmede standart ROS2 mesajları ve custom interface mesajları kullanılacaktır.
-
-Kritik topiclerde zaman bilgisi korunmalıdır.
-
-Timestamp gerektiren mesajlarda `std_msgs/Header header` alanı bulunmalıdır.
-
-İleride `tf2` kullanılabilmesi için frame ve zaman bilgileri korunmalıdır.
-
----
-
-# 16. AI Araçları İçin Kural
+# 13. Takım Kuralı
 
 Her AI aracı önce bu dosyayı okumalıdır.
 
 AI araçları:
 
-- Yeni ROS2 paketi oluşturmamalıdır.
-- Node dosya isimlerini değiştirmemelidir.
-- Topic isimlerini değiştirmemelidir.
-- Mesaj tiplerini değiştirmemelidir.
-- Sadece kendisine verilen node veya dosya üzerinde çalışmalıdır.
-- Mevcut çalışan node dosyalarını izinsiz değiştirmemelidir.
+- Yeni ROS2 paketi oluşturmayacaktır.
+- Bu listedeki node'lar dışında yeni node oluşturmayacaktır.
+- Topic isimlerini değiştirmeyecektir.
+- Mesaj tiplerini değiştirmeyecektir.
+- Mevcut çalışan node dosyalarını izinsiz değiştirmeyecektir.
+- Kamera node için referans topic `/albatros/kamera/image_raw` olacaktır.
