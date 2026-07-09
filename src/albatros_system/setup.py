@@ -29,6 +29,7 @@ setup(
             'mavros_node = albatros_system.mavros_node:main',
             'imu_sensor_node = albatros_system.imu_sensor_node:main',
             'gps_sensor_node = albatros_system.gps_sensor_node:main',
+            'mesafe_sensor_node = albatros_system.mesafe_sensor_node:main',
         ],
     },
 )
