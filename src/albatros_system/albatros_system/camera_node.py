@@ -3,8 +3,8 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
-from cv_bridge import CvBridge
 import cv2
+import numpy as np
 
 
 class CameraNode(Node):
@@ -21,8 +21,7 @@ class CameraNode(Node):
         self.frame_height = self.get_parameter('frame_height').value
         self.fps = self.get_parameter('fps').value
 
-        self.publisher_ = self.create_publisher(Image, '/camera/image_raw', 10)
-        self.bridge = CvBridge()
+        self.publisher_ = self.create_publisher(Image, '/albatros/kamera/image_raw', 10)
 
         self.cap = cv2.VideoCapture(self.camera_index)
 
@@ -48,9 +47,24 @@ class CameraNode(Node):
             
             frame = cv2.flip(frame, 1)   #sağ-sol ters görüntü için ekledim.
 
-            image_msg = self.bridge.cv2_to_imgmsg(frame, encoding='bgr8')
+            if len(frame.shape) == 2:
+                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            elif len(frame.shape) == 3 and frame.shape[2] == 4:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            
+            if frame.dtype != 'uint8':
+                frame = frame.astype(np.uint8)
+
+            image_msg = Image()
             image_msg.header.stamp = self.get_clock().now().to_msg()
             image_msg.header.frame_id = 'camera_frame'
+            image_msg.height = frame.shape[0]
+            image_msg.width = frame.shape[1]
+            image_msg.encoding = 'bgr8'
+            image_msg.is_bigendian = False
+            image_msg.step = frame.shape[1] * 3
+            image_msg.data = frame.tobytes()
+
             self.publisher_.publish(image_msg)
         else:
             self.get_logger().warn('Kameradan görüntü alınamadı.')
