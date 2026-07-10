@@ -33,5 +33,5 @@ setup(
         'costmap_node = albatros_system.costmap_node:main',
         'mission_node = albatros_system.mission_node:main',
     ],
-},
-)
+    }
+)   
