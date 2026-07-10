@@ -289,7 +289,8 @@ def main(args=None):
         node.get_logger().info('mavros_node kapatılıyor (KeyboardInterrupt).')
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

@@ -107,6 +107,8 @@ class MesafeSensorNode(Node):
         self.declare_parameter('field_of_view',   DEFAULT_FIELD_OF_VIEW)
         self.declare_parameter('fixed_range',     DEFAULT_FIXED_RANGE)
         self.declare_parameter('range_noise',     DEFAULT_RANGE_NOISE)
+        self.declare_parameter('range_topic',     RANGE_TOPIC)
+        self.declare_parameter('frame_id',        RANGE_FRAME_ID)
 
         self.simulate_mode = self.get_parameter('simulate_mode').value
         raw_rate           = self.get_parameter('publish_rate').value
@@ -115,6 +117,8 @@ class MesafeSensorNode(Node):
         raw_fov            = self.get_parameter('field_of_view').value
         raw_fixed          = self.get_parameter('fixed_range').value
         raw_noise          = self.get_parameter('range_noise').value
+        self.range_topic   = self.get_parameter('range_topic').value
+        self.frame_id      = self.get_parameter('frame_id').value
 
         # ------------------------------------------------------------------ #
         # Parametre güvenlik kontrolleri
@@ -192,7 +196,7 @@ class MesafeSensorNode(Node):
         # ------------------------------------------------------------------ #
         self.range_publisher = self.create_publisher(
             Range,
-            RANGE_TOPIC,
+            self.range_topic,
             qos_profile=10
         )
 
@@ -212,9 +216,9 @@ class MesafeSensorNode(Node):
         self.get_logger().info('=' * 60)
         self.get_logger().info('Mesafe Sensörü Node başlatıldı.')
         self.get_logger().info(f'  Mod             : {mode_str}')
-        self.get_logger().info(f'  Topic           : {RANGE_TOPIC}')
+        self.get_logger().info(f'  Topic           : {self.range_topic}')
         self.get_logger().info(f'  Yayın frekansı  : {self.publish_rate} Hz')
-        self.get_logger().info(f'  Frame ID        : {RANGE_FRAME_ID}')
+        self.get_logger().info(f'  Frame ID        : {self.frame_id}')
         self.get_logger().info(f'  min_range       : {self.min_range} m')
         self.get_logger().info(f'  max_range       : {self.max_range} m')
         self.get_logger().info(f'  field_of_view   : {self.field_of_view} rad')
@@ -259,7 +263,7 @@ class MesafeSensorNode(Node):
 
         # Header
         msg.header.stamp    = self.get_clock().now().to_msg()
-        msg.header.frame_id = RANGE_FRAME_ID
+        msg.header.frame_id = self.frame_id
 
         # Sensör tipi — ultrasonik
         msg.radiation_type = Range.ULTRASOUND
@@ -359,7 +363,7 @@ class MesafeSensorNode(Node):
 
             msg = Range()
             msg.header.stamp    = self.get_clock().now().to_msg()
-            msg.header.frame_id = RANGE_FRAME_ID
+            msg.header.frame_id = self.frame_id
 
             msg.radiation_type = Range.ULTRASOUND
             msg.field_of_view  = self.field_of_view

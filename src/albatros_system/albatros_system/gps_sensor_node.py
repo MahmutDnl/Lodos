@@ -51,6 +51,7 @@ import random
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import NavSatFix, NavSatStatus
 
 
@@ -161,6 +162,23 @@ class GpsSensorNode(Node):
         self._real_sensor_warning_printed = False
 
         # ------------------------------------------------------------------ #
+        # MAVROS köprüsü — simulate_mode=False ise gerçek GPS verisi alınır
+        # ------------------------------------------------------------------ #
+        self._latest_gps = None
+
+        if not self.simulate_mode:
+            self._mavros_gps_sub = self.create_subscription(
+                NavSatFix,
+                '/mavros/global_position/global',
+                self._mavros_gps_callback,
+                qos_profile=qos_profile_sensor_data,
+            )
+            self.get_logger().info(
+                'MAVROS GPS köprüsü aktif: /mavros/global_position/global -> '
+                f'{GPS_TOPIC}'
+            )
+
+        # ------------------------------------------------------------------ #
         # Publisher
         # ------------------------------------------------------------------ #
         self.gps_publisher = self.create_publisher(
@@ -260,123 +278,27 @@ class GpsSensorNode(Node):
     # Gerçek sensör okuma iskelet fonksiyonu
     # ================================================================== #
 
+    def _mavros_gps_callback(self, msg: NavSatFix) -> None:
+        """
+        /mavros/global_position/global topic'inden gelen GPS verisini yakalar.
+        frame_id'yi Albatros standardına günceller ve ara değişkende saklar.
+        """
+        msg.header.frame_id = GPS_FRAME_ID
+        self._latest_gps = msg
+
     def read_gps_sensor(self):
         """
-        Fiziksel GPS sensöründen veri okuyarak sensor_msgs/NavSatFix mesajı döndürür.
+        MAVROS köprüsü üzerinden gerçek GPS verisini döndürür.
 
-        Bu fonksiyon şu anda bir iskelet olarak bırakılmıştır.
-        Gerçek GPS sensörü belirlendikten sonra aşağıdaki TODO bölümleri
-        doldurulmalıdır.
-
-        Desteklenen bağlantı seçenekleri:
-          SEÇENEK 1 — UART/USB Serial (örn. u-blox, NMEA modülleri)
-          SEÇENEK 2 — I2C  (örn. Quectel L76-L gibi I2C GPS modülleri)
-          SEÇENEK 3 — MAVROS köprüsü (aşağıya bakınız)
-
-        MAVROS köprüsü hakkında not:
-          Pixhawk GPS verisi MAVROS aracılığıyla şu topic'ten okunabilir:
-            /mavros/global_position/global  (sensor_msgs/NavSatFix)
-          Bu MAVROS topic'i yalnızca bir veri KAYNAĞI olarak kullanılır.
-          Bu node /mavros/global_position/global topic'ine KESİNLİKLE publish etmez.
-          MAVROS kullanılırsa alınan veri /albatros/gps/fix olarak yeniden
-          yayınlanır (re-publish). Bu node'un dışarıya verdiği standart topic
-          her koşulda /albatros/gps/fix olarak kalmalıdır.
-          Yaklaşım: __init__ içinde self._latest_gps = None tanımlanır,
-          subscriber callback'te güncellenir, timer_callback'te publish edilir.
+        /mavros/global_position/global topic'inden gelen en son mesaj
+        _latest_gps'te tutulur. Henüz veri gelmediyse None döndürülür
+        (timer_callback bu döngüyü sessizce atlar).
 
         Dönüş:
-            sensor_msgs.msg.NavSatFix  — başarılı okumada dolu mesaj
-            None                       — okuma başarısızsa (yayın yapılmaz)
+            sensor_msgs.msg.NavSatFix  — MAVROS'tan gelen en son GPS mesajı
+            None                       — henüz veri gelmemişse
         """
-        try:
-            # -------------------------------------------------------------- #
-            # TODO: Gerçek GPS sensörü seçildikten sonra burası düzenlenecek.
-            #
-            # SEÇENEK 1 — UART / USB Serial (NMEA, örn. u-blox NEO-M8):
-            #   import serial
-            #   import pynmea2
-            #   ser = serial.Serial('/dev/ttyUSB0', 9600, timeout=1.0)
-            #   line = ser.readline().decode('ascii', errors='replace')
-            #   if line.startswith('$GPGGA') or line.startswith('$GNGGA'):
-            #       nmea = pynmea2.parse(line)
-            #       lat = nmea.latitude
-            #       lon = nmea.longitude
-            #       alt = nmea.altitude
-            #
-            # SEÇENEK 2 — I2C GPS:
-            #   import smbus2
-            #   bus = smbus2.SMBus(1)
-            #   raw = bus.read_i2c_block_data(GPS_I2C_ADDR, REG, 14)
-            #   ...
-            #
-            # SEÇENEK 3 — MAVROS köprüsü:
-            #   __init__ içinde subscriber aç:
-            #   self._latest_gps = None
-            #   self.mavros_gps_sub = self.create_subscription(
-            #       NavSatFix,
-            #       '/mavros/global_position/global',
-            #       self._mavros_gps_cb,
-            #       10
-            #   )
-            #
-            #   def _mavros_gps_cb(self, msg):
-            #       msg.header.frame_id = GPS_FRAME_ID
-            #       self._latest_gps = msg
-            #
-            #   Bu fonksiyonda: return self._latest_gps
-            #
-            # Sensör başlatma (port açma, kalibrasyon vb.) __init__ içinde yapın.
-            # -------------------------------------------------------------- #
-
-            # Gerçek sensör henüz uygulanmadı — bu satırı gerçek kodla değiştir!
-            raise NotImplementedError(
-                'read_gps_sensor() henüz uygulanmadı. '
-                'simulate_mode:=true parametresini kullanın.'
-            )
-
-            # -------------------------------------------------------------- #
-            # TODO: Sensör verisini okuduktan sonra aşağıdaki yapıyı doldurun.
-            # -------------------------------------------------------------- #
-            msg = NavSatFix()
-            msg.header.stamp    = self.get_clock().now().to_msg()
-            msg.header.frame_id = GPS_FRAME_ID
-
-            # TODO: GPS fix durumunu sensörden alın
-            msg.status.status  = NavSatStatus.STATUS_FIX
-            msg.status.service = NavSatStatus.SERVICE_GPS
-
-            # TODO: Enlem, boylam ve yüksekliği sensörden alın
-            msg.latitude  = 0.0
-            msg.longitude = 0.0
-            msg.altitude  = 0.0
-
-            msg.position_covariance = [
-                POSITION_COV_DIAG, 0.0,               0.0,
-                0.0,               POSITION_COV_DIAG,  0.0,
-                0.0,               0.0,                POSITION_COV_DIAG * 4.0,
-            ]
-            msg.position_covariance_type = NavSatFix.COVARIANCE_TYPE_APPROXIMATED
-
-            return msg
-
-        except NotImplementedError as e:
-            # Uyarı spam önlemi: yalnızca ilk döngüde bir kez uyarı ver
-            if not self._real_sensor_warning_printed:
-                self.get_logger().warn(
-                    f'GPS sensör okuma henüz uygulanmadı: {e} '
-                    '| Bu uyarı bir kez gösterilir. '
-                    '| simulate_mode:=true parametresini kullanabilirsiniz.'
-                )
-                self._real_sensor_warning_printed = True
-            return None
-
-        except Exception as e:
-            # Beklenmedik sensör hatası — node kapanmaz, bu döngü atlanır
-            self.get_logger().error(
-                f'GPS sensör okuma hatası: {e} '
-                '| Bu döngü için veri yayınlanmayacak.'
-            )
-            return None
+        return self._latest_gps
 
 
 # =============================================================================

@@ -39,6 +39,7 @@ import time
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Imu
 
 
@@ -109,6 +110,23 @@ class ImuSensorNode(Node):
         # ilk döngüde bir kez uyarı ver, sonraki döngülerde sessiz kal
         # ------------------------------------------------------------------ #
         self._real_sensor_warning_printed = False
+
+        # ------------------------------------------------------------------ #
+        # MAVROS köprüsü — simulate_mode=False ise gerçek IMU verisi alınır
+        # ------------------------------------------------------------------ #
+        self._latest_imu = None
+
+        if not self.simulate_mode:
+            self._mavros_imu_sub = self.create_subscription(
+                Imu,
+                '/mavros/imu/data',
+                self._mavros_imu_callback,
+                qos_profile=qos_profile_sensor_data,
+            )
+            self.get_logger().info(
+                'MAVROS IMU köprüsü aktif: /mavros/imu/data -> '
+                f'{IMU_TOPIC}'
+            )
 
         # ------------------------------------------------------------------ #
         # Publisher
@@ -226,142 +244,27 @@ class ImuSensorNode(Node):
     # Gerçek sensör okuma iskelet fonksiyonu
     # ================================================================== #
 
+    def _mavros_imu_callback(self, msg: Imu) -> None:
+        """
+        /mavros/imu/data topic'inden gelen IMU verisini yakalar.
+        frame_id'yi Albatros standardına günceller ve ara değişkende saklar.
+        """
+        msg.header.frame_id = IMU_FRAME_ID
+        self._latest_imu = msg
+
     def read_imu_sensor(self):
         """
-        Fiziksel IMU sensöründen veri okuyarak sensor_msgs/Imu mesajı döndürür.
+        MAVROS köprüsü üzerinden gerçek IMU verisini döndürür.
 
-        Bu fonksiyon şu anda bir iskelet olarak bırakılmıştır.
-        Gerçek IMU sensörü belirlendikten sonra aşağıdaki TODO bölümleri
-        doldurulmalıdır.
-
-        Desteklenen bağlantı seçenekleri:
-          SEÇENEK 1 — I2C  (örn. smbus2 + MPU-6050, BNO055, ICM-42688)
-          SEÇENEK 2 — SPI  (örn. spidev + ICM-42688, BMI088)
-          SEÇENEK 3 — UART (örn. pyserial + VectorNav VN-100, Xsens MTi)
-          SEÇENEK 4 — MAVROS köprüsü (aşağıya bakınız)
-
-        MAVROS köprüsü hakkında not:
-          Pixhawk IMU verisi MAVROS aracılığıyla /mavros/imu/data topic'inden
-          okunabilir. Bu durumda node içinde bir subscriber açılır ve
-          gelen veri /albatros/imu/data olarak yeniden yayınlanır (re-publish).
-          Bu yaklaşım seçilirse timer yerine subscriber callback kullanılmalı,
-          self._latest_imu gibi bir ara değişkenle veri tutulmalıdır.
-          Bu node'un dışarıya verdiği standart topic her durumda
-          /albatros/imu/data olarak kalmalıdır.
+        /mavros/imu/data topic'inden gelen en son mesaj _latest_imu'da
+        tutulur. Henüz veri gelmediyse None döndürülür (timer_callback
+        bu döngüyü sessizce atlar).
 
         Dönüş:
-            sensor_msgs.msg.Imu  — başarılı okumada dolu mesaj
-            None                 — okuma başarısızsa (yayın yapılmaz, node durmaz)
+            sensor_msgs.msg.Imu  — MAVROS'tan gelen en son IMU mesajı
+            None                 — henüz veri gelmemişse
         """
-        try:
-            # -------------------------------------------------------------- #
-            # TODO: Gerçek IMU sensörü seçildikten sonra burası düzenlenecek.
-            #
-            # SEÇENEK 1 — I2C (smbus2 örneği, MPU-6050):
-            #   import smbus2
-            #   bus = smbus2.SMBus(1)
-            #   raw = bus.read_i2c_block_data(0x68, 0x3B, 14)
-            #   accel_x = (raw[0] << 8 | raw[1]) / 16384.0 * GRAVITY
-            #   gyro_x  = (raw[8] << 8 | raw[9]) / 131.0 * (math.pi / 180.0)
-            #   ...
-            #
-            # SEÇENEK 2 — SPI (spidev örneği):
-            #   import spidev
-            #   spi = spidev.SpiDev()
-            #   spi.open(0, 0)
-            #   spi.max_speed_hz = 1000000
-            #   ...
-            #
-            # SEÇENEK 3 — UART (pyserial örneği):
-            #   import serial
-            #   ser = serial.Serial('/dev/ttyUSB0', 115200, timeout=0.02)
-            #   raw_line = ser.readline()
-            #   ...
-            #
-            # SEÇENEK 4 — MAVROS köprüsü:
-            #   __init__ içinde subscriber aç:
-            #   self.mavros_imu_sub = self.create_subscription(
-            #       Imu, '/mavros/imu/data', self._mavros_imu_cb, 10
-            #   )
-            #   self._latest_imu = None
-            #
-            #   def _mavros_imu_cb(self, msg):
-            #       msg.header.frame_id = IMU_FRAME_ID  # frame'i güncelle
-            #       self._latest_imu = msg
-            #
-            #   Bu fonksiyonda: return self._latest_imu
-            #
-            # Sensör başlatma (port açma, kalibrasyon vb.) __init__ içinde yapın.
-            # -------------------------------------------------------------- #
-
-            # Gerçek sensör henüz uygulanmadı — bu satırı gerçek kodla değiştir!
-            raise NotImplementedError(
-                'read_imu_sensor() henüz uygulanmadı. '
-                'simulate_mode=True parametresini kullanın.'
-            )
-
-            # -------------------------------------------------------------- #
-            # TODO: Sensör verisini okuduktan sonra aşağıdaki yapıyı doldurun.
-            # -------------------------------------------------------------- #
-            msg = Imu()
-            msg.header.stamp    = self.get_clock().now().to_msg()
-            msg.header.frame_id = IMU_FRAME_ID
-
-            # TODO: Sensörden quaternion alın; yoksa Euler → quaternion dönüştürün
-            msg.orientation.x = 0.0
-            msg.orientation.y = 0.0
-            msg.orientation.z = 0.0
-            msg.orientation.w = 1.0
-
-            msg.orientation_covariance = [
-                ORIENT_COV_DIAG, 0.0,             0.0,
-                0.0,             ORIENT_COV_DIAG,  0.0,
-                0.0,             0.0,              ORIENT_COV_DIAG,
-            ]
-
-            # TODO: Gyro değerlerini (rad/s) sensörden alın
-            msg.angular_velocity.x = 0.0
-            msg.angular_velocity.y = 0.0
-            msg.angular_velocity.z = 0.0
-
-            msg.angular_velocity_covariance = [
-                ANG_VEL_COV_DIAG, 0.0,                0.0,
-                0.0,              ANG_VEL_COV_DIAG,   0.0,
-                0.0,              0.0,                ANG_VEL_COV_DIAG,
-            ]
-
-            # TODO: İvmeölçer değerlerini (m/s²) sensörden alın
-            msg.linear_acceleration.x = 0.0
-            msg.linear_acceleration.y = 0.0
-            msg.linear_acceleration.z = GRAVITY
-
-            msg.linear_acceleration_covariance = [
-                LIN_ACC_COV_DIAG, 0.0,               0.0,
-                0.0,              LIN_ACC_COV_DIAG,   0.0,
-                0.0,              0.0,                LIN_ACC_COV_DIAG,
-            ]
-
-            return msg
-
-        except NotImplementedError as e:
-            # Uyarı spam önlemi: aynı mesajı her döngüde basmıyoruz.
-            # Gerçek sensör kodu yazılıncaya kadar yalnızca ilk kez uyarı ver.
-            if not self._real_sensor_warning_printed:
-                self.get_logger().warn(
-                    f'IMU sensör okuma henüz uygulanmadı: {e} '
-                    '| Bu uyarı bir kez gösterilir. '
-                    '| simulate_mode:=true parametresini kullanabilirsiniz.'
-                )
-                self._real_sensor_warning_printed = True
-            return None
-
-        except Exception as e:
-            # Beklenmedik sensör hatası — node kapanmaz, bu döngü atlanır
-            self.get_logger().error(
-                f'IMU sensör okuma hatası: {e} '
-                '| Bu döngü için veri yayınlanmayacak.'
-            )
-            return None
+        return self._latest_imu
 
     # ================================================================== #
     # Yardımcı: Euler → Quaternion
