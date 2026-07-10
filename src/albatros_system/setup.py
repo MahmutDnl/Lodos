@@ -33,6 +33,7 @@ setup(
         'costmap_node = albatros_system.costmap_node:main',
         'mission_node = albatros_system.mission_node:main',
         'state_node = albatros_system.state_node:main',
+        'yolo_mesafe_node = albatros_system.yolo_mesafe_node:main',
     ],
     }
 )   
