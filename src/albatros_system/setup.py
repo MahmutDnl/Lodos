@@ -32,6 +32,7 @@ setup(
         'mesafe_sensor_node = albatros_system.mesafe_sensor_node:main',
         'costmap_node = albatros_system.costmap_node:main',
         'mission_node = albatros_system.mission_node:main',
+        'state_node = albatros_system.state_node:main',
     ],
     }
 )   
