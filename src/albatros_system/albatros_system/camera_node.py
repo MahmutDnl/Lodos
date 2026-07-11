@@ -45,7 +45,7 @@ class CameraNode(Node):
 
         if ret:
             
-            frame = cv2.flip(frame, 1)   #sağ-sol ters görüntü için ekledim.
+            #frame = cv2.flip(frame, 1)   #sağ-sol ters görüntü için ekledim.
 
             if len(frame.shape) == 2:
                 frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
