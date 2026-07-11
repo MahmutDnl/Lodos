@@ -83,6 +83,45 @@ FUSION_CONF_AGREEMENT_WEIGHT  = 0.3
 WEIGHT_RANGE_NEAR_MAX  = 3.0   # 0.20 – 3.00 m: sensor agir
 WEIGHT_RANGE_MID_MAX   = 4.0   # 3.00 – 4.00 m: orta agirlik
 
+# class_name → costmap semantic type eslesme tablosu
+# Kamera sinif adlarindan costmap'in bekledigi tip degerlerine donusum.
+# Turuncu sinir dubasi border_buoy, sari engel dubasi obstacle_buoy,
+# kirmizi/yesil hedef dubasi target_buoy, Parkur-3 dogru hedefi goal_buoy.
+CLASS_NAME_TO_TYPE: dict[str, str] = {
+    'sari_duba':          'obstacle_buoy',
+    'yellow_buoy':        'obstacle_buoy',
+    'sari':               'obstacle_buoy',
+    'turuncu_duba':       'border_buoy',
+    'orange_buoy':        'border_buoy',
+    'turuncu':            'border_buoy',
+    'kirmizi_duba':       'target_buoy',
+    'red_buoy':           'target_buoy',
+    'kirmizi':            'target_buoy',
+    'yesil_duba':         'target_buoy',
+    'green_buoy':         'target_buoy',
+    'yesil':              'target_buoy',
+    'hedef_duba':         'goal_buoy',
+    'goal_buoy':          'goal_buoy',
+}
+
+# Varsayilan duba fiziksel yaricapi (metre)
+DEFAULT_BUOY_RADIUS_M = 0.15
+
+# Kameranin yatay gorus acisi (derece) — costmap FOV bilgisi icin
+CAMERA_FOV_DEG = 70.0
+
+
+def class_name_to_type(class_name: str) -> str:
+    """class_name stringini costmap semantic tipine donusturur."""
+    cn = class_name.lower().strip()
+    if cn in CLASS_NAME_TO_TYPE:
+        return CLASS_NAME_TO_TYPE[cn]
+    # Alt dize eslestirme
+    for key, typ in CLASS_NAME_TO_TYPE.items():
+        if key in cn:
+            return typ
+    return 'unknown'
+
 
 def safe_float(value, fallback=None):
     """NaN ve sonsuzlugu filtreler; gecersizse fallback dondurur."""
@@ -143,7 +182,7 @@ class DubaFusionNode(Node):
         self.declare_parameter('yan_sag_topic',
                                '/albatros/mesafe/yan_sag')
         self.declare_parameter('output_topic',
-                               '/albatros/fusion/duba_konumlari')
+                               '/albatros/fusion/obstacles')
 
         self.declare_parameter('min_yolo_confidence',      0.60)
         self.declare_parameter('sensor_timeout_sec',       0.50)
@@ -361,12 +400,31 @@ class DubaFusionNode(Node):
         if not fused_dets and not self._pub_empty:
             return
 
+        # costmap_node'un beklentisiyle uyumlu format:
+        # obstacles[] icinde x_m, y_m, type, confidence, id, radius_m
+        obstacles_for_costmap = []
+        for idx, d in enumerate(fused_dets):
+            obs_type = class_name_to_type(d.get('class_name', 'unknown'))
+            obstacles_for_costmap.append({
+                'id':            f"fusion_{idx}_{int(stamp * 1000) % 100000}",
+                'type':          obs_type,
+                'class_name':    d.get('class_name', 'unknown'),
+                'confidence':    d.get('fusion_confidence', 0.0),
+                'x_m':           d.get('x_body_m', 0.0),
+                'y_m':           d.get('y_body_m', 0.0),
+                'radius_m':      DEFAULT_BUOY_RADIUS_M,
+                'range_verified': d.get('fusion_source') == 'yolo_and_distance_sensor',
+            })
+
         payload = {
-            'stamp':           stamp,
-            'frame_id':        'base_link',
-            'source':          'duba_fusion_node',
-            'detection_count': len(fused_dets),
-            'detections':      fused_dets,
+            'stamp':            stamp,
+            'frame_id':         'base_link',
+            'source':           'duba_fusion_node',
+            'fusion_valid':     True,
+            'observed_fov_deg': CAMERA_FOV_DEG,
+            'observed_range_m': self._eff_max_range,
+            'detection_count':  len(obstacles_for_costmap),
+            'obstacles':        obstacles_for_costmap,
         }
 
         out_msg = String()
