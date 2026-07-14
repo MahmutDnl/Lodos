@@ -41,7 +41,7 @@ class YoloNode(Node):
         self.declare_parameter("detections_topic", "/albatros/yolo/tespitler")
         self.declare_parameter("obstacles_topic", "/albatros/yolo/obstacles")
 
-        self.declare_parameter("model_path", "models/best.pt")
+        self.declare_parameter("model_path", "models/nihai_albatros_duba_yolo11s_best.pt")
         self.declare_parameter("confidence_threshold", 0.50)
         self.declare_parameter("iou_threshold", 0.45)
         self.declare_parameter("device", "cpu")
