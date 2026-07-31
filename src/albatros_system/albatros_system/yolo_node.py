@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import numpy as np
@@ -15,18 +14,30 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
+# Hailo platform imports
+try:
+    from hailo_platform import (
+        HEF, VDevice, ConfigureParams,
+        InputVStreamParams, OutputVStreamParams,
+        InferVStreams, FormatType
+    )
+except ImportError:
+    # Handle the case where we are not on the deployment machine yet, 
+    # but still let the node script be syntactically valid.
+    pass
+
 
 class YoloNode(Node):
     """
-    Albatros YOLO perception node.
+    Albatros YOLO perception node using Hailo AI Kit.
 
     Subscribes:
-        /camera/image_raw          sensor_msgs/Image
+        /albatros/kamera/image_raw          sensor_msgs/Image
 
     Publishes:
-        /yolo/processed_image      sensor_msgs/Image
-        /yolo/detections           std_msgs/String JSON
-        /perception/obstacles      std_msgs/String JSON
+        /albatros/kamera/processed          sensor_msgs/Image
+        /albatros/yolo/tespitler            std_msgs/String JSON
+        /albatros/yolo/obstacles            std_msgs/String JSON
 
     Saves:
         Processed camera video as mp4 with timestamp, bounding boxes,
@@ -41,10 +52,11 @@ class YoloNode(Node):
         self.declare_parameter("detections_topic", "/albatros/yolo/tespitler")
         self.declare_parameter("obstacles_topic", "/albatros/yolo/obstacles")
 
-        self.declare_parameter("model_path", "models/nihai_albatros_duba_yolo11s_best.pt")
+        self.declare_parameter("model_path", "models/yolov11s.hef")
         self.declare_parameter("confidence_threshold", 0.50)
         self.declare_parameter("iou_threshold", 0.45)
-        self.declare_parameter("device", "cpu")
+        self.declare_parameter("model_input_width", 640)
+        self.declare_parameter("model_input_height", 640)
 
         self.declare_parameter("save_video", True)
         self.declare_parameter("video_output_dir", "~/albatros_outputs/videos")
@@ -62,7 +74,8 @@ class YoloNode(Node):
         self.model_path = str(self.get_parameter("model_path").value)
         self.confidence_threshold = float(self.get_parameter("confidence_threshold").value)
         self.iou_threshold = float(self.get_parameter("iou_threshold").value)
-        self.device = str(self.get_parameter("device").value)
+        self.model_input_width = int(self.get_parameter("model_input_width").value)
+        self.model_input_height = int(self.get_parameter("model_input_height").value)
 
         self.save_video = bool(self.get_parameter("save_video").value)
         self.video_output_dir = Path(
@@ -75,7 +88,19 @@ class YoloNode(Node):
         self.draw_detections = bool(self.get_parameter("draw_detections").value)
 
         self.bridge = CvBridge()
-        self.model = self.load_model()
+        
+        # Hardcoded class names from the YOLO model
+        self.class_names = {
+            0: 'kirmizi_duba',
+            1: 'sari_duba',
+            2: 'siyah_duba',
+            3: 'turuncu_duba',
+            4: 'yesil_duba'
+        }
+        
+        self.vdevice = None
+        self.infer_pipeline = None
+        self.load_model()
 
         self.processed_image_pub = self.create_publisher(
             Image,
@@ -105,7 +130,7 @@ class YoloNode(Node):
         self.video_writer = None
         self.video_path = None
 
-        self.get_logger().info("YOLO node started.")
+        self.get_logger().info("YOLO Hailo node started.")
         self.get_logger().info(f"Subscribing: {self.input_image_topic}")
         self.get_logger().info(f"Publishing processed image: {self.processed_image_topic}")
         self.get_logger().info(f"Publishing detections JSON: {self.detections_topic}")
@@ -113,12 +138,14 @@ class YoloNode(Node):
 
     def load_model(self):
         try:
-            from ultralytics import YOLO
+            from hailo_platform import HEF, VDevice, ConfigureParams, InputVStreamParams, OutputVStreamParams, FormatType
         except ImportError as exc:
             self.get_logger().error(
-                "ultralytics is not installed. Install with: pip install ultralytics"
+                "hailo_platform is not installed. This node requires HailoRT and hailo_platform."
             )
-            raise exc
+            # return rather than raise, to allow node to be created and compiled on dev machine
+            self.get_logger().error("Model loading aborted due to missing hailo_platform.")
+            return
 
         model_path = Path(self.model_path).expanduser()
 
@@ -140,12 +167,56 @@ class YoloNode(Node):
 
         if not model_path.exists():
             raise FileNotFoundError(
-                f"YOLO model file not found: {model_path}. "
-                "Put best.pt into models/ or pass model_path parameter."
+                f"Hailo HEF model file not found: {model_path}. "
+                "Put yolov11s.hef into models/ or pass model_path parameter."
             )
 
-        self.get_logger().info(f"Loading YOLO model: {model_path}")
-        return YOLO(str(model_path))
+        self.get_logger().info(f"Loading Hailo HEF model: {model_path}")
+        
+        hef = HEF(str(model_path))
+        
+        self.vdevice = VDevice()
+        
+        configure_params = ConfigureParams.create_from_hef(hef=hef, interface=None)
+        self.network_group = self.vdevice.configure(hef, configure_params)[0]
+        self.network_group_params = self.network_group.create_params()
+        
+        self.input_vstream_info = hef.get_input_vstream_infos()[0]
+        self.output_vstream_infos = hef.get_output_vstream_infos()
+        
+        self.input_vstreams_params = InputVStreamParams.make_from_network_group(
+            self.network_group, quantized=False, format_type=FormatType.UINT8
+        )
+        
+        # Determine whether output is quantized or not based on typical usage, Float32 is easier to parse
+        self.output_vstreams_params = OutputVStreamParams.make_from_network_group(
+            self.network_group, quantized=False, format_type=FormatType.FLOAT32
+        )
+        
+        self.get_logger().info("Hailo model configured successfully.")
+
+    def preprocess_frame(self, frame):
+        """BGR frame'i model giriş boyutuna letterbox ile ölçekle."""
+        ih, iw = frame.shape[:2]
+        h, w = self.model_input_height, self.model_input_width
+        
+        scale = min(w / iw, h / ih)
+        nw, nh = int(iw * scale), int(ih * scale)
+        resized = cv2.resize(frame, (nw, nh))
+        
+        canvas = np.full((h, w, 3), 128, dtype=np.uint8)
+        dx, dy = (w - nw) // 2, (h - nh) // 2
+        canvas[dy:dy+nh, dx:dx+nw] = resized
+        
+        # Hailo models typically expect RGB
+        canvas_rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+        
+        self._preprocess_scale = scale
+        self._preprocess_dx = dx
+        self._preprocess_dy = dy
+        self._original_size = (iw, ih)
+        
+        return canvas_rgb
 
     def ros_image_to_cv2(self, msg: Image):
         if msg.encoding not in ("bgr8", "rgb8", "mono8", "8UC3"):
@@ -197,72 +268,149 @@ class YoloNode(Node):
     def run_yolo(self, frame, stamp_float):
         processed = frame.copy()
         detections = []
-
-        results = self.model.predict(
-            source=frame,
-            conf=self.confidence_threshold,
-            iou=self.iou_threshold,
-            device=self.device,
-            verbose=False
-        )
-
-        if not results:
+        
+        if self.vdevice is None:
+            # Model is not loaded (likely missing hailo_platform)
             return processed, detections
+            
+        from hailo_platform import InferVStreams
 
-        result = results[0]
-        names = result.names
+        input_frame = self.preprocess_frame(frame)
+        input_data = {
+            self.input_vstream_info.name: np.expand_dims(input_frame, axis=0)
+        }
 
-        if result.boxes is None:
-            return processed, detections
+        with InferVStreams(self.network_group, self.input_vstreams_params, self.output_vstreams_params) as pipeline:
+            with self.network_group.activate(self.network_group_params):
+                results = pipeline.infer(input_data)
 
-        for box in result.boxes:
-            xyxy = box.xyxy[0].cpu().numpy()
-            x1, y1, x2, y2 = [int(v) for v in xyxy]
+        # Post process results
+        detections = self.postprocess_results(results, stamp_float)
 
-            confidence = float(box.conf[0].cpu().numpy())
-            class_id = int(box.cls[0].cpu().numpy())
-            class_name = str(names.get(class_id, class_id))
-
-            cx = int((x1 + x2) / 2)
-            cy = int((y1 + y2) / 2)
-            width = int(x2 - x1)
-            height = int(y2 - y1)
-
-            detection = {
-                "stamp": stamp_float,
-                "class_id": class_id,
-                "class_name": class_name,
-                "confidence": confidence,
-                "bbox": {
-                    "x_min": x1,
-                    "y_min": y1,
-                    "x_max": x2,
-                    "y_max": y2,
-                    "width": width,
-                    "height": height
-                },
-                "center": {
-                    "x": cx,
-                    "y": cy
-                }
-            }
-
-            detections.append(detection)
-
+        for det in detections:
             if self.draw_detections:
                 self.draw_detection(
                     processed,
-                    x1,
-                    y1,
-                    x2,
-                    y2,
-                    cx,
-                    cy,
-                    class_name,
-                    confidence
+                    det["bbox"]["x_min"],
+                    det["bbox"]["y_min"],
+                    det["bbox"]["x_max"],
+                    det["bbox"]["y_max"],
+                    det["center"]["x"],
+                    det["center"]["y"],
+                    det["class_name"],
+                    det["confidence"]
                 )
 
         return processed, detections
+
+    def postprocess_results(self, results, stamp_float):
+        detections = []
+        
+        scale = self._preprocess_scale
+        dx = self._preprocess_dx
+        dy = self._preprocess_dy
+        orig_w, orig_h = self._original_size
+        
+        # Birden fazla output stream olabilir, NMS olan stream genelde "nms" ismini icerir veya tek streamdir
+        nms_output = None
+        for info in self.output_vstream_infos:
+            out_tensor = results[info.name][0] # batch 0
+            if "nms" in info.name.lower() or out_tensor.shape[-1] == 6:
+                nms_output = out_tensor
+                break
+        
+        # Eger NMS ciktisi bulamadiysak, ilk stream'i deneyelim (Shape: (num_boxes, 6))
+        if nms_output is None and len(self.output_vstream_infos) > 0:
+            info = self.output_vstream_infos[0]
+            out_tensor = results[info.name][0]
+            if out_tensor.shape[-1] == 6:
+                nms_output = out_tensor
+
+        if nms_output is not None:
+            # Standart Hailo NMS Output format: [ymin, xmin, ymax, xmax, confidence, class_id] 
+            # ya da bazi hef'lerde [xmin, ymin, xmax, ymax, confidence, class_id] olabilir.
+            # Deneyimlere gore genelde [ymin, xmin, ymax, xmax, confidence, class_id] doner.
+            for box in nms_output:
+                
+                if len(box) >= 6:
+                    # HEF NMS layer'ina gore format: ymin, xmin, ymax, xmax veya xmin, ymin, xmax, ymax
+                    # Standart olarak Hailo RT on-chip NMS ymin, xmin, ymax, xmax formatindadir.
+                    ymin, xmin, ymax, xmax, confidence, class_id = box[:6]
+                    
+                    # Confidence esik degeri kontrolu (Bazen Hailo 0 basar veya NMS sonrasi cok dusuk conf kalabilir)
+                    if confidence < self.confidence_threshold:
+                        continue
+                    
+                    class_id = int(class_id)
+                    class_name = self.class_names.get(class_id, str(class_id))
+                    
+                    # Coordinates are usually normalized [0..1]
+                    # If they are already > 1, then they are absolute coordinates, but typical hailo NMS is normalized.
+                    if xmax <= 1.0 and ymax <= 1.0:
+                        xmin_px = xmin * self.model_input_width
+                        xmax_px = xmax * self.model_input_width
+                        ymin_px = ymin * self.model_input_height
+                        ymax_px = ymax * self.model_input_height
+                    else:
+                        xmin_px, ymin_px, xmax_px, ymax_px = xmin, ymin, xmax, ymax
+                        
+                    # Y ile X bazen yer degistirmis olabilir (xmin, ymin, xmax, ymax). 
+                    # Sayet xmin > ymin veya ymax > xmax kontrolleri ile emin olamayiz. 
+                    # Fakat Hailo'nun standart bbox parser'inda ymin, xmin, ymax, xmax gelir.
+                    
+                    # Letterbox ters islemi (Letterbox yapilmis 640x640 frame'den orijinal frame'e donus)
+                    x1 = int((xmin_px - dx) / scale)
+                    y1 = int((ymin_px - dy) / scale)
+                    x2 = int((xmax_px - dx) / scale)
+                    y2 = int((ymax_px - dy) / scale)
+                    
+                    # Sinirlari orijinal resim boyutuna kirp
+                    x1 = max(0, min(x1, orig_w - 1))
+                    y1 = max(0, min(y1, orig_h - 1))
+                    x2 = max(0, min(x2, orig_w - 1))
+                    y2 = max(0, min(y2, orig_h - 1))
+                    
+                    # Koordinatlarin yanlis gelme ihtimaline karsi bir fallback kontrolu
+                    # (xmin ve ymin yer degistirdiyse x1 ve x2 yanlis olacaktir)
+                    if x1 > x2:
+                        x1, x2 = x2, x1
+                    if y1 > y2:
+                        y1, y2 = y2, y1
+                    
+                    width = int(x2 - x1)
+                    height = int(y2 - y1)
+                    
+                    # Eger bbox gecersiz bir boyutta ise yoksay
+                    if width <= 0 or height <= 0:
+                        continue
+                    
+                    cx = int((x1 + x2) / 2)
+                    cy = int((y1 + y2) / 2)
+                    
+                    detection = {
+                        "stamp": stamp_float,
+                        "class_id": class_id,
+                        "class_name": class_name,
+                        "confidence": float(confidence),
+                        "bbox": {
+                            "x_min": x1,
+                            "y_min": y1,
+                            "x_max": x2,
+                            "y_max": y2,
+                            "width": width,
+                            "height": height
+                        },
+                        "center": {
+                            "x": cx,
+                            "y": cy
+                        }
+                    }
+                    detections.append(detection)
+        else:
+            self.get_logger().warn("NMS output format mismatch. Ensure HEF was compiled with nms_postprocess.", throttle_duration_sec=5.0)
+
+        return detections
+
 
     def draw_detection(self, frame, x1, y1, x2, y2, cx, cy, class_name, confidence):
         label = f"{class_name} {confidence:.2f}"
@@ -446,6 +594,10 @@ class YoloNode(Node):
         if self.video_writer is not None:
             self.video_writer.release()
             self.get_logger().info(f"Video saved: {self.video_path}")
+            
+        if self.vdevice is not None:
+            self.vdevice.release()
+            self.get_logger().info("Hailo VDevice released.")
 
         super().destroy_node()
 
