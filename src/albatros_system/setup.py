@@ -35,6 +35,7 @@ setup(
         'state_node = albatros_system.state_node:main',
         'yolo_mesafe_node = albatros_system.yolo_mesafe_node:main',
         'duba_fusion_node = albatros_system.duba_fusion_node:main',
+        'telemetry_security_node = albatros_system.telemetry_security_node:main',
     ],
     }
 )   
