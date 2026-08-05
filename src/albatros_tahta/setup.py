@@ -26,6 +26,7 @@ setup(
     'console_scripts': [
         'kamera_node = albatros_tahta.kamera_node:main',
         'yolo_node = albatros_tahta.yolo_node:main',
+	'yolo_mesafe_node = albatros_tahta_yolo_node:main',
         'mesafe_sensor_node = albatros_tahta.mesafe_sensor_node:main',
         'costmap_node = albatros_tahta.costmap_node:main',
         'duba_fusion_node = albatros_tahta.duba_fusion_node:main',
