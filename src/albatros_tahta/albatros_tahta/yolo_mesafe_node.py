@@ -20,7 +20,7 @@ class YoloMesafeNode(Node):
         # fx, cx ve distance_width_constant değerleri geçici kalibrasyon değerleridir.
         # Bu değerler gerçek kamera ve duba testlerinden sonra güncellenecektir.
         self.declare_parameter('fx', 900.0)
-        self.declare_parameter('cx', 640.0)
+        self.declare_parameter('cx', 320.0)
         self.declare_parameter('distance_width_constant', 360.0)
         
         self.declare_parameter('min_yolo_confidence', 0.60)
