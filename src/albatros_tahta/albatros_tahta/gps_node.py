@@ -26,7 +26,7 @@ class GpsSensorNode(Node):
     def __init__(self):
         super().__init__('gps_sensor_node')
 
-        self.declare_parameter('simulate_mode', True)
+        self.declare_parameter('simulate_mode', False)
         self.declare_parameter('publish_rate', DEFAULT_PUBLISH_RATE)
         self.declare_parameter('base_latitude', DEFAULT_LATITUDE)
         self.declare_parameter('base_longitude', DEFAULT_LONGITUDE)

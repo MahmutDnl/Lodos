@@ -25,6 +25,11 @@ class CameraNode(Node):
 
         self.cap = cv2.VideoCapture(self.camera_index)
 
+        # Logitech C920: Donanımsal MJPG sıkıştırmasını aktif et.
+        # Varsayılan YUYV formatı RPi5 üzerinde USB bant genişliğini
+        # aşırı kullanır ve FPS düşüşüne neden olur.
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
         self.cap.set(cv2.CAP_PROP_FPS, self.fps)
@@ -43,15 +48,13 @@ class CameraNode(Node):
     def publish_frame(self):
         ret, frame = self.cap.read()
 
-        if ret:
-            
+        if ret:            
             #frame = cv2.flip(frame, 1)   #sağ-sol ters görüntü için ekledim.
 
             if len(frame.shape) == 2:
                 frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
             elif len(frame.shape) == 3 and frame.shape[2] == 4:
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-            
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)            
             if frame.dtype != 'uint8':
                 frame = frame.astype(np.uint8)
 

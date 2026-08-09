@@ -97,7 +97,7 @@ class ImuSensorNode(Node):
         # ─── Parametre Tanımları ─────────────────────────────────────────
         self.declare_parameter(
             'simulate_mode',
-            True
+            False
         )
 
         self.declare_parameter(
@@ -112,7 +112,7 @@ class ImuSensorNode(Node):
 
         self.declare_parameter(
             'mode_filter_enabled',
-            True
+            False
         )
 
         self.declare_parameter(
