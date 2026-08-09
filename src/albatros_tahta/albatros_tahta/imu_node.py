@@ -175,6 +175,13 @@ class ImuSensorNode(Node):
         self._connection_lost_logged = False
         self._connection_established_logged = False
 
+        # Okunabilir IMU özet değerleri (derece / rad/s / m/s²)
+        self._latest_roll_deg = 0.0
+        self._latest_pitch_deg = 0.0
+        self._latest_yaw_deg = 0.0
+        self._latest_ang_vel = (0.0, 0.0, 0.0)
+        self._latest_lin_acc = (0.0, 0.0, 0.0)
+
         # ─── MAVROS Subscription'ları (Gerçek Sensör Modu) ───────────────
         if not self.simulate_mode:
             # Pixhawk uçuş durumu (mod, bağlantı, arm)
@@ -214,6 +221,12 @@ class ImuSensorNode(Node):
             self._health_timer = self.create_timer(
                 1.0,
                 self._check_connection_health
+            )
+
+            # Okunabilir IMU özet timer'ı (1 Hz)
+            self._summary_timer = self.create_timer(
+                1.0,
+                self._print_summary
             )
 
         # ─── Publisher ───────────────────────────────────────────────────
@@ -322,15 +335,27 @@ class ImuSensorNode(Node):
             self._current_mode != prev_mode
             and prev_mode != 'UNKNOWN'
         ):
-            is_active = (
-                self._current_mode in ACTIVE_FLIGHT_MODES
+            mod_aciklama = {
+                'MANUAL': 'Kumanda ile manuel yönlendirme',
+                'GUIDED': 'Otonom görev modu (ROS2 komutları aktif)',
+                'AUTO': 'Otonom waypoint takibi',
+                'STABILIZE': 'Dengeleme modu',
+                'HOLD': 'Pozisyon tutma modu',
+                'LOITER': 'Bekleme modu',
+            }
+
+            aciklama = mod_aciklama.get(
+                self._current_mode,
+                'Tanımsız mod'
             )
 
             self.get_logger().info(
-                f'Uçuş modu değişti: {prev_mode} -> '
-                f'{self._current_mode} | '
-                f'IMU yayını: '
-                f'{"AKTİF ✓" if is_active or not self.mode_filter_enabled else "DURDURULDU ✗"}'
+                f'\n'
+                f'  ╔══════════════════════════════════════════╗\n'
+                f'  ║  MOD DEĞİŞİKLİĞİ: {prev_mode} -> {self._current_mode:<12s}║\n'
+                f'  ║  Açıklama: {aciklama:<31s}║\n'
+                f'  ║  Armed: {str(self._pixhawk_armed):<33s}║\n'
+                f'  ╚══════════════════════════════════════════╝'
             )
 
     def _mavros_imu_callback(
@@ -353,6 +378,27 @@ class ImuSensorNode(Node):
         msg.header.frame_id = IMU_FRAME_ID
 
         self._latest_imu = msg
+
+        # Okunabilir özet için euler açılarını ve vektörleri hesapla
+        self._latest_roll_deg, self._latest_pitch_deg, self._latest_yaw_deg = \
+            self._quaternion_to_euler_deg(
+                msg.orientation.x,
+                msg.orientation.y,
+                msg.orientation.z,
+                msg.orientation.w
+            )
+
+        self._latest_ang_vel = (
+            msg.angular_velocity.x,
+            msg.angular_velocity.y,
+            msg.angular_velocity.z
+        )
+
+        self._latest_lin_acc = (
+            msg.linear_acceleration.x,
+            msg.linear_acceleration.y,
+            msg.linear_acceleration.z
+        )
 
     # =====================================================================
     # Ana Timer Callback
@@ -464,6 +510,83 @@ class ImuSensorNode(Node):
                 '✓ Pixhawk bağlantısı yeniden sağlandı!'
             )
             self._connection_lost_logged = False
+
+    # =====================================================================
+    # Okunabilir IMU Özeti
+    # =====================================================================
+
+    def _print_summary(self):
+        """
+        1 Hz periyotla terminale okunabilir IMU özeti yazdırır.
+        Mevcut uçuş modu, yönelim (Roll/Pitch/Yaw), açısal hız
+        ve ivme değerlerini gösterir.
+        """
+        if self._latest_imu is None:
+            if not self._mavros_connected:
+                self.get_logger().info(
+                    'IMU verisi bekleniyor... '
+                    '(Pixhawk bağlantısı yok)'
+                )
+            return
+
+        mode = self._current_mode
+        armed = 'ARMED' if self._pixhawk_armed else 'DISARMED'
+
+        r = self._latest_roll_deg
+        p = self._latest_pitch_deg
+        y = self._latest_yaw_deg
+
+        gx, gy, gz = self._latest_ang_vel
+        ax, ay, az = self._latest_lin_acc
+
+        self.get_logger().info(
+            f'[{mode} | {armed}] '
+            f'Roll:{r:+7.2f}  Pitch:{p:+7.2f}  '
+            f'Yaw:{y:+7.2f} (derece) | '
+            f'Gyro: {gx:+.4f} {gy:+.4f} '
+            f'{gz:+.4f} rad/s | '
+            f'Ivme: {ax:+.2f} {ay:+.2f} '
+            f'{az:+.2f} m/s2'
+        )
+
+    # =====================================================================
+    # Quaternion → Euler Dönüşümü
+    # =====================================================================
+
+    @staticmethod
+    def _quaternion_to_euler_deg(x, y, z, w):
+        """
+        Quaternion (x, y, z, w) değerlerinden Euler açılarını
+        (roll, pitch, yaw) derece cinsinden hesaplar.
+
+        Roll  = X ekseni etrafında dönüş (sağa/sola yatma)
+        Pitch = Y ekseni etrafında dönüş (öne/arkaya eğilme)
+        Yaw   = Z ekseni etrafında dönüş (pusula yönü)
+        """
+        # Roll (x ekseni)
+        sinr_cosp = 2.0 * (w * x + y * z)
+        cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+        roll = math.atan2(sinr_cosp, cosr_cosp)
+
+        # Pitch (y ekseni)
+        sinp = 2.0 * (w * y - z * x)
+        if abs(sinp) >= 1.0:
+            pitch = math.copysign(
+                math.pi / 2, sinp
+            )
+        else:
+            pitch = math.asin(sinp)
+
+        # Yaw (z ekseni)
+        siny_cosp = 2.0 * (w * z + x * y)
+        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+        yaw = math.atan2(siny_cosp, cosy_cosp)
+
+        return (
+            math.degrees(roll),
+            math.degrees(pitch),
+            math.degrees(yaw)
+        )
 
     # =====================================================================
     # Simülasyon IMU Verisi Üretimi

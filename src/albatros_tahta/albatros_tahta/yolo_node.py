@@ -178,10 +178,17 @@ class YoloNode(Node):
             self.get_logger().info(f"HEF Input [{i}]: name={info.name}, shape={info.shape}, format={info.format}")
             if i == 0:
                 # Update model input size dynamically if possible
-                if len(info.shape) >= 3:
+                if len(info.shape) == 3:
+                    self.model_input_height = info.shape[0]
+                    self.model_input_width = info.shape[1]
+                    self.model_input_channels = info.shape[2]
+                elif len(info.shape) == 4:
                     self.model_input_height = info.shape[1]
                     self.model_input_width = info.shape[2]
-                    self.get_logger().info(f"Updated model dimensions from HEF: {self.model_input_width}x{self.model_input_height}")
+                    self.model_input_channels = info.shape[3]
+                self.get_logger().info(
+                    f"Updated model dimensions from HEF: {self.model_input_width}x{self.model_input_height}x{getattr(self, 'model_input_channels', 3)}"
+                )
 
         # Log HEF Output Info
         output_infos = self.hef.get_output_vstream_infos()
@@ -293,8 +300,8 @@ class YoloNode(Node):
         dx, dy = (w - nw) // 2, (h - nh) // 2
         canvas[dy:dy+nh, dx:dx+nw] = resized
         
-        # Assumed RGB based on original script, but may need to be BGR
         canvas_rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+        canvas_rgb = np.ascontiguousarray(canvas_rgb, dtype=np.uint8)
         
         self._preprocess_scale = scale
         self._preprocess_dx = dx
@@ -312,8 +319,18 @@ class YoloNode(Node):
             
         input_frame = self.preprocess_frame(frame)
         input_name = self.hef.get_input_vstream_infos()[0].name
+        
+        input_tensor = np.expand_dims(input_frame, axis=0)
+        input_tensor = np.ascontiguousarray(input_tensor, dtype=np.uint8)
+
+        self.get_logger().info(
+            f"Hailo input shape={input_tensor.shape}, "
+            f"dtype={input_tensor.dtype}, "
+            f"nbytes={input_tensor.nbytes}"
+        )
+
         input_data = {
-            input_name: np.expand_dims(input_frame, axis=0)
+            input_name: input_tensor
         }
 
         results = self.infer_pipeline.infer(input_data)

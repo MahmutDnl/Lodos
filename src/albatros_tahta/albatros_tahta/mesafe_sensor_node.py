@@ -4,11 +4,18 @@
 # =============================================================================
 # Dosya    : mesafe_sensor_node.py
 # Node adi : mesafe_sensor_node
-# Paket    : albatros_system
-# Gorev    : Aracin on sol, on sag, yan sol ve yan sag konumlarindaki dort adet
-#            JSN-SR04T ultrasonik mesafe sensorunden gelen uzaklik bilgisini
-#            okuyarak her birine ozel ROS 2 topic'ine yayinlamak.
-#            Karar vermez, motor/mavros komutu gondermez; yalnizca veri uretir.
+# Paket    : albatros_system / albatros_tahta
+# Gorev    : Aracin on sol ve on sag konumlarindaki iki adet ultrasonik mesafe
+#            sensorunden (Arduino'ya bagli) gelen uzaklik bilgisini USB Serial
+#            uzerinden okuyarak ROS 2 sensor_msgs/msg/Range topic'lerine yayinlamak.
+#
+# Mimari   : 2 adet ultrasonik mesafe sensörü -> Arduino -> USB Serial -> RPi ->
+#            mesafe_sensor_node.py -> ROS 2 Topicleri
+#
+# Format   : Arduino'dan gelen serial veriler SENSOR1_CM,SENSOR2_CM formatindadir.
+#            (Ornek: "179,145"). Node bu veriyi metreye çevirerek yayinlar.
+#            -1 veya <=0 olan veriler gecersiz kabul edilir ve yayinlanmaz.
+#
 # Yazan    : LODOS Yazilim Ekibi
 # Tarih    : 2026
 # =============================================================================
@@ -16,13 +23,12 @@
 # Bagimliliklar:
 #   - rclpy
 #   - sensor_msgs  (sensor_msgs/msg/Range)
+#   - pyserial     (import serial)
 #   - random       (simulasyon modu icin)
 #
 # Yayinlanan Topic'ler (sensor_msgs/msg/Range):
-#   /albatros/mesafe/on_sol   — on sol sensor
-#   /albatros/mesafe/on_sag   — on sag sensor
-#   /albatros/mesafe/yan_sol  — yan sol sensor
-#   /albatros/mesafe/yan_sag  — yan sag sensor
+#   /albatros/mesafe/on_sol   — on sol sensor (SENSOR 1)
+#   /albatros/mesafe/on_sag   — on sag sensor (SENSOR 2)
 #
 # Genel Parametreler:
 #   simulate_mode      (bool,  varsayilan: True)
@@ -33,49 +39,46 @@
 #   range_noise        (float, varsayilan: 0.05 m std)
 #   log_measurements   (bool,  varsayilan: False)
 #
-# Simulasyon Parametreleri (her sensor icin):
-#   on_sol_fixed_range   (float, varsayilan: 2.0 m)
-#   on_sag_fixed_range   (float, varsayilan: 2.5 m)
-#   yan_sol_fixed_range  (float, varsayilan: 3.0 m)
-#   yan_sag_fixed_range  (float, varsayilan: 4.0 m)
+# Gercek Sensor Serial Parametreleri:
+#   serial_port        (str,   varsayilan: '/dev/ttyUSB0')
+#   baud_rate          (int,   varsayilan: 115200)
+#   serial_timeout     (float, varsayilan: 0.05)
 #
-# Gercek Sensor GPIO Parametreleri:
-#   on_sol_trigger_pin   (int, varsayilan: 17)
-#   on_sol_echo_pin      (int, varsayilan: 18)
-#   on_sag_trigger_pin   (int, varsayilan: 22)
-#   on_sag_echo_pin      (int, varsayilan: 23)
-#   yan_sol_trigger_pin  (int, varsayilan: 24)
-#   yan_sol_echo_pin     (int, varsayilan: 25)
-#   yan_sag_trigger_pin  (int, varsayilan: 5)
-#   yan_sag_echo_pin     (int, varsayilan: 6)
+# Simulasyon Parametreleri (her sensor icin):
+#   on_sol_fixed_range (float, varsayilan: 2.0 m)
+#   on_sag_fixed_range (float, varsayilan: 2.5 m)
 #
 # Uyumluluk:
-#   ROS 2 Jazzy (Ubuntu 24.04). rclpy.spin() yapisi korunmustur.
+#   ROS 2 Jazzy (Ubuntu 24.04). Python 3.
 # =============================================================================
 
 import random
-import time
 
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Range
+
+try:
+    import serial
+except ImportError:
+    serial = None
 
 
 # =============================================================================
 # Sabitler — varsayilan degerler
 # =============================================================================
 
-DEFAULT_PUBLISH_RATE  = 20.0   # Hz
-DEFAULT_MIN_RANGE     = 0.20   # metre
-DEFAULT_MAX_RANGE     = 4.50   # metre
-DEFAULT_FIELD_OF_VIEW = 0.26   # radyan (~15 derece)
-DEFAULT_RANGE_NOISE   = 0.05   # metre (Gaussian std)
+DEFAULT_PUBLISH_RATE   = 20.0   # Hz
+DEFAULT_MIN_RANGE      = 0.20   # metre
+DEFAULT_MAX_RANGE      = 4.50   # metre
+DEFAULT_FIELD_OF_VIEW  = 0.26   # radyan (~15 derece)
+DEFAULT_RANGE_NOISE    = 0.05   # metre (Gaussian std)
 
-# GPIO okuma timeout'u — echo sinyali bu sure gelmezse okuma iptal edilir
-GPIO_ECHO_TIMEOUT_SEC = 0.05   # saniye
+DEFAULT_SERIAL_PORT    = '/dev/ttyUSB0'
+DEFAULT_BAUD_RATE      = 115200
+DEFAULT_SERIAL_TIMEOUT = 0.05   # saniye
 
-# Olcum logu throttle suresi — her N saniyede bir basilir
-LOG_THROTTLE_SEC = 3.0
+LOG_THROTTLE_SEC       = 3.0
 
 
 # =============================================================================
@@ -84,36 +87,16 @@ LOG_THROTTLE_SEC = 3.0
 
 SENSOR_DEFINITIONS = {
     'on_sol': {
-        'topic':    '/albatros/mesafe/on_sol',
-        'frame_id': 'on_sol_sensor_link',
-        'label':    '[ON SOL] ',
-        'default_fixed_range':  2.0,
-        'default_trigger_pin':  17,
-        'default_echo_pin':     18,
+        'topic':               '/albatros/mesafe/on_sol',
+        'frame_id':            'on_sol_sensor_link',
+        'label':               '[ON SOL] ',
+        'default_fixed_range': 2.0,
     },
     'on_sag': {
-        'topic':    '/albatros/mesafe/on_sag',
-        'frame_id': 'on_sag_sensor_link',
-        'label':    '[ON SAG] ',
-        'default_fixed_range':  2.5,
-        'default_trigger_pin':  22,
-        'default_echo_pin':     23,
-    },
-    'yan_sol': {
-        'topic':    '/albatros/mesafe/yan_sol',
-        'frame_id': 'yan_sol_sensor_link',
-        'label':    '[YAN SOL]',
-        'default_fixed_range':  3.0,
-        'default_trigger_pin':  24,
-        'default_echo_pin':     25,
-    },
-    'yan_sag': {
-        'topic':    '/albatros/mesafe/yan_sag',
-        'frame_id': 'yan_sag_sensor_link',
-        'label':    '[YAN SAG]',
-        'default_fixed_range':  4.0,
-        'default_trigger_pin':  5,
-        'default_echo_pin':     6,
+        'topic':               '/albatros/mesafe/on_sag',
+        'frame_id':            'on_sag_sensor_link',
+        'label':               '[ON SAG] ',
+        'default_fixed_range': 2.5,
     },
 }
 
@@ -124,13 +107,11 @@ SENSOR_DEFINITIONS = {
 
 class MesafeSensorNode(Node):
     """
-    Dort JSN-SR04T ultrasonik mesafe sensorunden alinan verileri
-    ayri ROS 2 topic'lerine yayinlayan publisher node.
+    Arduino USB Serial uzerinden iki adet ultrasonik mesafe sensorunden
+    alinan verileri ayri ROS 2 topic'lerine yayinlayan publisher node.
 
     simulate_mode=True  → Her sensor icin ayri sabit mesafe + Gaussian gurultu.
-    simulate_mode=False → GPIO Trigger/Echo ile gercek sensor okumasi (iskelet).
-                          Sensor henuz uygulanmamissa tek sefer uyari verir;
-                          node kapanmaz, ilgili sensorun o dongusu atlanir.
+    simulate_mode=False → USB Serial (/dev/ttyUSB0) uzerinden Arduino verisi okur.
     """
 
     def __init__(self):
@@ -147,8 +128,18 @@ class MesafeSensorNode(Node):
         self.declare_parameter('range_noise',      DEFAULT_RANGE_NOISE)
         self.declare_parameter('log_measurements', False)
 
+        # ------------------------------------------------------------------ #
+        # Serial parametreleri (Gercek sensor modu)
+        # ------------------------------------------------------------------ #
+        self.declare_parameter('serial_port',    DEFAULT_SERIAL_PORT)
+        self.declare_parameter('baud_rate',      DEFAULT_BAUD_RATE)
+        self.declare_parameter('serial_timeout', DEFAULT_SERIAL_TIMEOUT)
+
         self.simulate_mode    = self.get_parameter('simulate_mode').value
         self.log_measurements = self.get_parameter('log_measurements').value
+        self.serial_port      = str(self.get_parameter('serial_port').value)
+        self.baud_rate        = int(self.get_parameter('baud_rate').value)
+        self.serial_timeout   = float(self.get_parameter('serial_timeout').value)
 
         raw_rate  = self.get_parameter('publish_rate').value
         raw_min   = self.get_parameter('min_range').value
@@ -176,12 +167,11 @@ class MesafeSensorNode(Node):
         )
 
         # ------------------------------------------------------------------ #
-        # Sensor'e ozel parametreler (simulasyon sabit mesafe + GPIO pinleri)
+        # Sensor'e ozel parametreler (simulasyon sabit mesafe)
         # ------------------------------------------------------------------ #
         self.sensors = {}
 
         for name, defn in SENSOR_DEFINITIONS.items():
-            # Simulasyon sabit mesafesi
             fixed_param = f'{name}_fixed_range'
             self.declare_parameter(fixed_param, defn['default_fixed_range'])
             raw_fixed = self.get_parameter(fixed_param).value
@@ -193,15 +183,6 @@ class MesafeSensorNode(Node):
                     f'{clamped} m olarak sinirlandirildi.'
                 )
 
-            # GPIO pin parametreleri
-            trig_param = f'{name}_trigger_pin'
-            echo_param = f'{name}_echo_pin'
-            self.declare_parameter(trig_param, defn['default_trigger_pin'])
-            self.declare_parameter(echo_param, defn['default_echo_pin'])
-            trigger_pin = self.get_parameter(trig_param).value
-            echo_pin    = self.get_parameter(echo_param).value
-
-            # Publisher
             pub = self.create_publisher(Range, defn['topic'], 10)
 
             self.sensors[name] = {
@@ -209,20 +190,15 @@ class MesafeSensorNode(Node):
                 'frame_id':    defn['frame_id'],
                 'label':       defn['label'],
                 'fixed_range': clamped,
-                'trigger_pin': trigger_pin,
-                'echo_pin':    echo_pin,
                 'publisher':   pub,
-                # Uyari spam onleyici — NotImplementedError icin
-                'warned':      False,
             }
 
         # ------------------------------------------------------------------ #
-        # GPIO baslatma (gercek sensor modu)
-        # Simulasyon modunda atlanir; gercek modda iskelet hazir.
+        # Serial port baglantisi (gercek sensor modu)
         # ------------------------------------------------------------------ #
-        self._gpio_initialized = False
+        self.serial_connection = None
         if not self.simulate_mode:
-            self._init_gpio()
+            self._init_serial()
 
         # ------------------------------------------------------------------ #
         # Olcum log throttle zamanlayici
@@ -277,6 +253,89 @@ class MesafeSensorNode(Node):
         return value
 
     # ================================================================== #
+    # Serial Port Baslatma
+    # ================================================================== #
+
+    def _init_serial(self):
+        """
+        Gercek sensor modunda Arduino USB Serial portunu bir kez acmaya calisir.
+        Hata durumunda node çökmez, log basar ve serial_connection None kalir.
+        """
+        if serial is None:
+            self.get_logger().error(
+                'pyserial modulu (import serial) bulunamadi. '
+                'Lutfen "sudo apt install python3-serial" komutu ile yukleyin.'
+            )
+            self.serial_connection = None
+            return
+
+        try:
+            self.serial_connection = serial.Serial(
+                port=self.serial_port,
+                baudrate=self.baud_rate,
+                timeout=self.serial_timeout
+            )
+            self.get_logger().info(
+                f'Arduino serial bağlantısı açıldı: {self.serial_port} @ {self.baud_rate}'
+            )
+        except serial.SerialException as e:
+            self.get_logger().error(f'Serial port açılamadı: {e}')
+            self.serial_connection = None
+        except Exception as e:
+            self.get_logger().error(f'Beklenmeyen serial bağlantı hatası: {e}')
+            self.serial_connection = None
+
+    # ================================================================== #
+    # Serial Veri Okuma
+    # ================================================================== #
+
+    def _read_serial_distances(self):
+        """
+        Arduino USB Serial portundan tek bir satir okur ve 2 sensörün mesafelerini m cinsinden dondurur.
+        Gelen veri formati: SENSOR_1_CM,SENSOR_2_CM (Ornek: "179,145")
+
+        Returns:
+            (s1_m, s2_m) şeklinde tuple veya okunacak veri yoksa/hataliysa None.
+            s1_m veya s2_m gecersiz (-1 veya <= 0) ise o eleman None olur.
+        """
+        if self.serial_connection is None or not self.serial_connection.is_open:
+            return None
+
+        try:
+            if self.serial_connection.in_waiting == 0:
+                return None
+
+            raw_line = self.serial_connection.readline()
+            if not raw_line:
+                return None
+
+            line_str = raw_line.decode('utf-8', errors='ignore').strip()
+            if not line_str:
+                return None
+
+            parts = line_str.split(',')
+            if len(parts) != 2:
+                return None
+
+            s1_cm = float(parts[0])
+            s2_cm = float(parts[1])
+
+            s1_m = (s1_cm / 100.0) if s1_cm > 0 else None
+            s2_m = (s2_cm / 100.0) if s2_cm > 0 else None
+
+            return s1_m, s2_m
+
+        except ValueError:
+            # Sayisal olmayan hatali format
+            return None
+        except Exception as e:
+            if serial and isinstance(e, serial.SerialException):
+                self.get_logger().error(f'Serial okuma hatasi: {e}')
+            else:
+                self.get_logger().error(f'Beklenmeyen serial okuma hatasi: {e}')
+            return None
+
+    # ================================================================== #
     # Baslangic Logu
     # ================================================================== #
 
@@ -285,12 +344,12 @@ class MesafeSensorNode(Node):
         mode_str = (
             'SIMULASYON (simulate_mode=True)'
             if self.simulate_mode
-            else 'GERCEK SENSOR (simulate_mode=False)'
+            else 'GERCEK SENSOR - ARDUINO USB SERIAL (simulate_mode=False)'
         )
         sep = '=' * 64
 
         self.get_logger().info(sep)
-        self.get_logger().info('Mesafe Sensoru Node baslatildi. (4 sensor)')
+        self.get_logger().info('Mesafe Sensoru Node baslatildi. (2 sensor)')
         self.get_logger().info(f'  Mod            : {mode_str}')
         self.get_logger().info(f'  Yayin frekansi : {self.publish_rate} Hz')
         self.get_logger().info(f'  min_range      : {self.min_range} m')
@@ -300,6 +359,10 @@ class MesafeSensorNode(Node):
             self.get_logger().info(
                 f'  range_noise    : {self.range_noise} m (Gaussian std)'
             )
+        else:
+            self.get_logger().info(f'  Serial port    : {self.serial_port}')
+            self.get_logger().info(f'  Baud rate      : {self.baud_rate}')
+            self.get_logger().info(f'  Serial timeout : {self.serial_timeout} s')
         self.get_logger().info('  Sensorler:')
         for name, s in self.sensors.items():
             if self.simulate_mode:
@@ -311,8 +374,7 @@ class MesafeSensorNode(Node):
             else:
                 self.get_logger().info(
                     f'    {s["label"]}  topic={s["topic"]}  '
-                    f'frame={s["frame_id"]}  '
-                    f'TRIG={s["trigger_pin"]}  ECHO={s["echo_pin"]}'
+                    f'frame={s["frame_id"]}'
                 )
         self.get_logger().info(sep)
 
@@ -323,23 +385,43 @@ class MesafeSensorNode(Node):
     def timer_callback(self):
         """
         Belirlenen frekansta cagirilir.
-        Her sensor icin sirasyla olcum yapilir ve kendi topic'ine yayinlanir.
-        Bir sensorde hata olusursa yalnizca o sensorum o dongusu atlanir;
-        diger sensorler etkilenmez.
+        simulate_mode=True  → on_sol ve on_sag icin simule edilmis mesajlar uretir.
+        simulate_mode=False → Serial porttan TEK SATIR okur, gecerli olan sensorler icin mesaj yayinlar.
         """
         log_lines = []
 
-        for name, sensor in self.sensors.items():
-            if self.simulate_mode:
+        if self.simulate_mode:
+            for name in self.sensors:
                 msg = self.generate_simulated_distance(name)
-            else:
-                msg = self.read_real_distance(name)
+                if msg is not None:
+                    self.sensors[name]['publisher'].publish(msg)
+                    if self.log_measurements:
+                        log_lines.append(
+                            f'{self.sensors[name]["label"]} {msg.range:.2f} metre (Sim).'
+                        )
+        else:
+            distances = self._read_serial_distances()
+            if distances is None:
+                return
 
-            if msg is not None:
-                sensor['publisher'].publish(msg)
+            s1_m, s2_m = distances
+
+            # Sensor 1 -> on_sol
+            if s1_m is not None:
+                msg1 = self.create_range_message('on_sol', s1_m)
+                self.sensors['on_sol']['publisher'].publish(msg1)
                 if self.log_measurements:
                     log_lines.append(
-                        f'{sensor["label"]} {msg.range:.2f} metre mesafe olculdü.'
+                        f'{self.sensors["on_sol"]["label"]} {msg1.range:.2f} metre.'
+                    )
+
+            # Sensor 2 -> on_sag
+            if s2_m is not None:
+                msg2 = self.create_range_message('on_sag', s2_m)
+                self.sensors['on_sag']['publisher'].publish(msg2)
+                if self.log_measurements:
+                    log_lines.append(
+                        f'{self.sensors["on_sag"]["label"]} {msg2.range:.2f} metre.'
                     )
 
         # Olcum loglarini throttle ile yazdir
@@ -359,7 +441,7 @@ class MesafeSensorNode(Node):
         Verilen sensor adi ve mesafe degerinden sensor_msgs/Range mesaji olusturur.
 
         Args:
-            sensor_name: 'on_sol', 'on_sag', 'yan_sol', 'yan_sag'
+            sensor_name: 'on_sol', 'on_sag'
             distance:    Metre cinsinden olculen mesafe.
 
         Returns:
@@ -390,7 +472,7 @@ class MesafeSensorNode(Node):
         gercekci bir Range mesaji uretir.
 
         Args:
-            sensor_name: Sensor anahtari ('on_sol', 'on_sag', ...)
+            sensor_name: Sensor anahtari ('on_sol', 'on_sag')
 
         Returns:
             sensor_msgs/msg/Range
@@ -400,176 +482,31 @@ class MesafeSensorNode(Node):
         return self.create_range_message(sensor_name, noisy)
 
     # ================================================================== #
-    # Gercek Sensor Okuma (iskelet + GPIO altyapisi)
-    # ================================================================== #
-
-    def _init_gpio(self):
-        """
-        Gercek sensor modunda GPIO pinlerini baslatir.
-        Baslatma islemi yalnizca __init__ icerisinden cagirilir;
-        timer callback icinde tekrarlanmaz.
-
-        NOT: RPi.GPIO veya lgpio gibi bir kutuphane kurulu olmalidir.
-             Kutuphane bulunamazsa node uyari verir; simulate_mode=True'ya
-             gecmez ancak gercek okuma basarisiz olacaktir.
-        """
-        try:
-            import RPi.GPIO as GPIO  # noqa: F401
-            GPIO.setmode(GPIO.BCM)
-            GPIO.setwarnings(False)
-
-            for name, sensor in self.sensors.items():
-                GPIO.setup(sensor['trigger_pin'], GPIO.OUT)
-                GPIO.setup(sensor['echo_pin'],    GPIO.IN)
-                # Trigger'i pasif konumda birak
-                GPIO.output(sensor['trigger_pin'], False)
-
-            self._gpio_initialized = True
-            self.get_logger().info(
-                'GPIO pinleri basariyla baslatildi (RPi.GPIO).'
-            )
-
-        except ImportError:
-            self.get_logger().warn(
-                'RPi.GPIO kutuphanesi bulunamadi. '
-                'Gercek sensor okumasi calismaycak. '
-                'simulate_mode:=true parametresini kullanin.'
-            )
-        except Exception as e:
-            self.get_logger().error(
-                f'GPIO baslatma hatasi: {e}. '
-                'Gercek sensor okumasi calismaycak.'
-            )
-
-    def _read_gpio_distance(self, sensor_name: str) -> float | None:
-        """
-        JSN-SR04T icin GPIO Trigger/Echo protokolu ile mesafe okur.
-
-        - 10 µs tetik sinyali gonderilir.
-        - Echo sinyalinin yukselmesi ve dusmesi beklenir.
-        - GPIO_ECHO_TIMEOUT_SEC suresi icerisinde sinyal gelmezse None doner.
-        - Sonsuz while dongusu yoktur; her adimda timeout kontrolu yapilir.
-
-        Args:
-            sensor_name: 'on_sol', 'on_sag', 'yan_sol', 'yan_sag'
-
-        Returns:
-            Metre cinsinden mesafe veya None (timeout/hata durumunda).
-        """
-        try:
-            import RPi.GPIO as GPIO
-
-            trig = self.sensors[sensor_name]['trigger_pin']
-            echo = self.sensors[sensor_name]['echo_pin']
-
-            # 10 µs tetik sinyali
-            GPIO.output(trig, True)
-            time.sleep(0.00001)
-            GPIO.output(trig, False)
-
-            # Echo yukselmesini bekle
-            deadline = time.time() + GPIO_ECHO_TIMEOUT_SEC
-            while GPIO.input(echo) == 0:
-                if time.time() > deadline:
-                    return None
-            pulse_start = time.time()
-
-            # Echo dusmesini bekle
-            deadline = time.time() + GPIO_ECHO_TIMEOUT_SEC
-            while GPIO.input(echo) == 1:
-                if time.time() > deadline:
-                    return None
-            pulse_end = time.time()
-
-            # Mesafeyi hesapla: ses hizi ~343 m/s, gidis-donus bolunur 2'ye
-            pulse_duration = pulse_end - pulse_start
-            distance_m     = (pulse_duration * 34300.0) / 2.0 / 100.0
-
-            return distance_m
-
-        except ImportError:
-            return None
-        except Exception:
-            return None
-
-    def read_real_distance(self, sensor_name: str) -> Range | None:
-        """
-        Fiziksel sensor okur ve Range mesaji dondurur.
-
-        Gercek GPIO okumasi basarisiz olursa veya henuz uygulanmamissa
-        None dondurur; node kapanmaz, ilgili sensorun dongusu atlanir.
-
-        Args:
-            sensor_name: 'on_sol', 'on_sag', 'yan_sol', 'yan_sag'
-
-        Returns:
-            sensor_msgs/msg/Range veya None.
-        """
-        sensor = self.sensors[sensor_name]
-
-        try:
-            if not self._gpio_initialized:
-                # GPIO hazir degil — yalnizca ilk seferinde uyar
-                if not sensor['warned']:
-                    self.get_logger().warn(
-                        f'{sensor["label"]} GPIO baslatilmadigi icin '
-                        'sensor okunamadi. '
-                        'simulate_mode:=true parametresini kullanabilirsiniz.'
-                    )
-                    sensor['warned'] = True
-                return None
-
-            distance = self._read_gpio_distance(sensor_name)
-
-            if distance is None:
-                # Timeout veya okuma hatasi — sessizce atla
-                return None
-
-            return self.create_range_message(sensor_name, distance)
-
-        except NotImplementedError as e:
-            if not sensor['warned']:
-                self.get_logger().warn(
-                    f'{sensor["label"]} okuma henuz uygulanmadi: {e} '
-                    '| Bu uyari bir kez gosterilir. '
-                    '| simulate_mode:=true parametresini kullanabilirsiniz.'
-                )
-                sensor['warned'] = True
-            return None
-
-        except Exception as e:
-            self.get_logger().error(
-                f'{sensor["label"]} beklenmedik okuma hatasi: {e} '
-                '| Bu dongu icin veri yayinlanmayacak.'
-            )
-            return None
-
-    # ================================================================== #
-    # Node kapanisi
+    # Node Kapanisi
     # ================================================================== #
 
     def destroy_node(self):
         """
-        Node kapanirken GPIO kaynaklarini guvenli sekilde serbest birakir.
+        Node kapanirken Serial baglantisini guvenli sekilde kapatir.
         """
-        if self._gpio_initialized:
+        if hasattr(self, 'serial_connection') and self.serial_connection is not None:
             try:
-                import RPi.GPIO as GPIO
-                GPIO.cleanup()
-                self.get_logger().info('GPIO kaynakları temizlendi.')
+                if self.serial_connection.is_open:
+                    self.serial_connection.close()
+                    self.get_logger().info('Arduino serial bağlantısı kapatıldı.')
             except Exception as e:
-                self.get_logger().warn(f'GPIO temizleme hatasi: {e}')
+                self.get_logger().warn(f'Serial port kapatma hatasi: {e}')
         super().destroy_node()
 
 
 # =============================================================================
-# Giris noktasi
+# Giris Noktasi
 # =============================================================================
 
 def main(args=None):
     """
     Node baslangic fonksiyonu.
-    Cagri: ros2 run albatros_system mesafe_sensor_node
+    Cagri: ros2 run albatros_tahta mesafe_sensor_node
     """
     rclpy.init(args=args)
     node = MesafeSensorNode()
