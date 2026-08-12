@@ -1,7 +1,23 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# =============================================================================
+# LODOS Albatros — YOLO Perception Node with Hailo AI Kit (v4)
+# =============================================================================
+# ROS2 Jazzy / Ubuntu 24.04
+#
+# Girişler:
+#   - /albatros/kamera/image_raw  [sensor_msgs/Image]
+#   - /albatros/mission/status    [albatros_interfaces/MissionStatus]
+#   - /albatros/state             [albatros_interfaces/VehicleState]
+#
+# Çıkışlar:
+#   - /albatros/kamera/processed  [sensor_msgs/Image]
+#   - /albatros/yolo/tespitler    [std_msgs/String JSON] (conf >= 0.30)
+#   - /albatros/yolo/obstacles    [std_msgs/String JSON]
+#   - /albatros/yolo/status       [std_msgs/String JSON]
+# =============================================================================
 
 import json
+import os
 import threading
 import time
 from datetime import datetime
@@ -15,7 +31,20 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
+try:
+    from ament_index_python.packages import get_package_share_directory
+except ImportError:
+    get_package_share_directory = None
+
+try:
+    from albatros_interfaces.msg import MissionStatus, VehicleState
+except ImportError:
+    MissionStatus = None
+    VehicleState = None
+
 # Hailo platform imports
+HAILO_AVAILABLE = False
+HAILO_IMPORT_ERROR = None
 try:
     from hailo_platform import (
         HEF, VDevice, ConfigureParams,
@@ -23,42 +52,41 @@ try:
         InputVStreamParams, OutputVStreamParams,
         InferVStreams, FormatType
     )
+    HAILO_AVAILABLE = True
 except ImportError as exc:
-    raise RuntimeError(
-        "hailo_platform is not installed or cannot be imported. "
-        "This node requires HailoRT and hailo_platform to run on the target hardware."
-    ) from exc
+    HAILO_AVAILABLE = False
+    HAILO_IMPORT_ERROR = str(exc)
 
 
 class YoloNode(Node):
     """
-    Albatros YOLO perception node using Hailo AI Kit.
-
-    Subscribes:
-        /albatros/kamera/image_raw          sensor_msgs/Image
-
-    Publishes:
-        /albatros/kamera/processed          sensor_msgs/Image
-        /albatros/yolo/tespitler            std_msgs/String JSON
-        /albatros/yolo/obstacles            std_msgs/String JSON
+    Albatros YOLO algılama node'u (Hailo AI Kit desteği ile).
+    Parkur 1-2 ve Parkur 3 için çift HEF model switching ve 0.30 confidence filtreleme sunar.
     """
 
     def __init__(self):
         super().__init__("yolo_node")
 
-        # ROS Parameters
+        # ─── ROS Parametreleri ───────────────────────────────────────────────
         self.declare_parameter("input_image_topic", "/albatros/kamera/image_raw")
         self.declare_parameter("processed_image_topic", "/albatros/kamera/processed")
         self.declare_parameter("detections_topic", "/albatros/yolo/tespitler")
         self.declare_parameter("obstacles_topic", "/albatros/yolo/obstacles")
+        self.declare_parameter("status_topic", "/albatros/yolo/status")
 
-        self.declare_parameter("model_path", "models/yolov11s.hef")
-        self.declare_parameter("confidence_threshold", 0.50)
-        # iou_threshold removed as requested if unused (assuming Hailo NMS handles it or it's unhandled right now)
+        self.declare_parameter("model_path", "models/parkur12.hef")
+        self.declare_parameter("parkur12_model_path", "models/parkur12.hef")
+        self.declare_parameter("parkur3_model_path", "models/parkur3.hef")
+
+        # Global YOLO confidence threshold (0.30 canonical value across all parkours)
+        self.declare_parameter("confidence_threshold", 0.30)
+        self.declare_parameter("yolo_conf_threshold", 0.30)
+
         self.declare_parameter("model_input_width", 640)
         self.declare_parameter("model_input_height", 640)
+        self.declare_parameter("model_switch_debounce_sec", 0.5)
 
-        self.declare_parameter("save_video", False) # Default False
+        self.declare_parameter("save_video", False)
         self.declare_parameter("video_output_dir", "~/albatros_outputs/videos")
         self.declare_parameter("video_fps", 10.0)
 
@@ -70,11 +98,21 @@ class YoloNode(Node):
         self.processed_image_topic = str(self.get_parameter("processed_image_topic").value)
         self.detections_topic = str(self.get_parameter("detections_topic").value)
         self.obstacles_topic = str(self.get_parameter("obstacles_topic").value)
+        self.status_topic = str(self.get_parameter("status_topic").value)
 
-        self.model_path = str(self.get_parameter("model_path").value)
-        self.confidence_threshold = float(self.get_parameter("confidence_threshold").value)
+        self.parkur12_model_path_param = str(self.get_parameter("parkur12_model_path").value)
+        self.parkur3_model_path_param = str(self.get_parameter("parkur3_model_path").value)
+        self.legacy_model_path_param = str(self.get_parameter("model_path").value)
+
+        # Confidence eşiğini 0.30 kabul et
+        conf_val = float(self.get_parameter("yolo_conf_threshold").value)
+        if conf_val <= 0.0:
+            conf_val = float(self.get_parameter("confidence_threshold").value)
+        self.confidence_threshold = max(conf_val, 0.30)
+
         self.model_input_width = int(self.get_parameter("model_input_width").value)
         self.model_input_height = int(self.get_parameter("model_input_height").value)
+        self.model_switch_debounce_sec = float(self.get_parameter("model_switch_debounce_sec").value)
 
         self.save_video = bool(self.get_parameter("save_video").value)
         self.video_output_dir = Path(str(self.get_parameter("video_output_dir").value)).expanduser()
@@ -84,25 +122,34 @@ class YoloNode(Node):
         self.draw_center = bool(self.get_parameter("draw_center").value)
         self.draw_detections = bool(self.get_parameter("draw_detections").value)
 
-        # Ensure class order is documented as needing verification with best.pt
-        # TODO: Verify this order matches the trained YOLOv11s model classes.
-        self.class_names = {
-            0: 'kirmizi_duba',
-            1: 'sari_duba',
-            2: 'siyah_duba',
-            3: 'turuncu_duba',
-            4: 'yesil_duba'
+        # ─── Model Class Mapping ─────────────────────────────────────────────
+        self.class_mappings = {
+            "parkur12": {
+                0: "kirmizi_duba",
+                1: "sari_duba",
+                2: "siyah_duba",
+                3: "turuncu_duba",
+                4: "yesil_duba"
+            },
+            "parkur3": {
+                0: "kirmizi_duba",
+                1: "sari_duba",
+                2: "siyah_duba",
+                3: "turuncu_duba",
+                4: "yesil_duba"
+            }
         }
 
-        # Latest frame buffer and threading for low latency
+        # ─── Frame Buffer ve Lock'lar ─────────────────────────────────────────
         self.latest_frame = None
         self.latest_stamp = None
         self.latest_msg = None
         self.frame_lock = threading.Lock()
+        self.inference_lock = threading.Lock()
         self.frame_event = threading.Event()
         self.running = True
-        
-        # Hailo variables
+
+        # ─── Hailo Platform Değişkenleri ────────────────────────────────────
         self.vdevice = None
         self.hef = None
         self.network_group = None
@@ -111,6 +158,15 @@ class YoloNode(Node):
         self.output_vstreams_params = None
         self.infer_pipeline = None
         self.activation_context = None
+        self.active_model_name = None
+
+        self.parkur12_resolved_path = None
+        self.parkur3_resolved_path = None
+        self.parkur12_available = False
+        self.parkur3_available = False
+
+        self.last_model_switch_request_time = 0.0
+        self.pending_requested_model = None
 
         self.video_writer = None
         self.video_path = None
@@ -119,14 +175,20 @@ class YoloNode(Node):
         self._preprocess_dx = 0
         self._preprocess_dy = 0
         self._original_size = (640, 640)
+        self._first_frame_logged = False
+        self._last_status_pub_time = 0.0
+        self._last_inference_ok = False
 
-        # Initialization
+        # ─── Hailo ve Model Başlatma ─────────────────────────────────────────
         self.init_hailo()
 
+        # ─── Publisher'lar ──────────────────────────────────────────────────
         self.processed_image_pub = self.create_publisher(Image, self.processed_image_topic, 10)
         self.detections_pub = self.create_publisher(String, self.detections_topic, 10)
         self.obstacles_pub = self.create_publisher(String, self.obstacles_topic, 10)
+        self.status_pub = self.create_publisher(String, self.status_topic, 10)
 
+        # ─── Subscriber'lar ─────────────────────────────────────────────────
         self.image_sub = self.create_subscription(
             Image,
             self.input_image_topic,
@@ -134,89 +196,305 @@ class YoloNode(Node):
             qos_profile_sensor_data
         )
 
-        # Start worker thread
+        if MissionStatus is not None:
+            self.mission_status_sub = self.create_subscription(
+                MissionStatus,
+                "/albatros/mission/status",
+                self.mission_status_callback,
+                10
+            )
+
+        if VehicleState is not None:
+            self.vehicle_state_sub = self.create_subscription(
+                VehicleState,
+                "/albatros/state",
+                self.vehicle_state_callback,
+                10
+            )
+
+        # ─── Worker Thread ──────────────────────────────────────────────────
         self.worker_thread = threading.Thread(target=self.inference_worker, daemon=True)
         self.worker_thread.start()
 
-        self.get_logger().info("YOLO Hailo node started.")
-        self.get_logger().info(f"Subscribing: {self.input_image_topic}")
-        self.get_logger().info(f"Publishing processed image: {self.processed_image_topic}")
-        self.get_logger().info(f"Publishing detections JSON: {self.detections_topic}")
-        self.get_logger().info(f"Publishing obstacle candidates: {self.obstacles_topic}")
+        self._publish_status()
+
+    # =========================================================================
+    # Path Çözümleme & Hata Loglama
+    # =========================================================================
+
+    def resolve_model_path(self, raw_path_str: str, model_key: str = ""):
+        """
+        HEF model dosya yolunu ROS2 package share, source tree ve workspace dizinlerinde arar.
+        Geriye (resolved_path_or_None, attempted_paths_list) döndürür.
+        """
+        attempted = []
+        p = Path(raw_path_str).expanduser()
+
+        if p.is_absolute():
+            attempted.append(p)
+            if p.exists():
+                return p.resolve(), attempted
+
+        filename = p.name
+
+        candidates = [
+            p,
+            Path.cwd() / p,
+            Path.cwd() / "models" / filename,
+        ]
+
+        if get_package_share_directory is not None:
+            for pkg in ["albatros_tahta", "albatros_system"]:
+                try:
+                    share_dir = Path(get_package_share_directory(pkg))
+                    candidates.append(share_dir / raw_path_str)
+                    candidates.append(share_dir / "models" / filename)
+                except Exception:
+                    pass
+
+        current_file = Path(__file__).resolve()
+        package_dir = current_file.parent
+        workspace_src = package_dir.parents[2] if len(package_dir.parents) >= 3 else package_dir
+
+        candidates.extend([
+            package_dir / raw_path_str,
+            package_dir / "models" / filename,
+            workspace_src / "albatros_tahta" / raw_path_str,
+            workspace_src / "albatros_tahta" / "models" / filename,
+            workspace_src / "albatros_system" / raw_path_str,
+            workspace_src / "albatros_system" / "models" / filename,
+            workspace_src / "models" / filename,
+        ])
+
+        for cand in candidates:
+            if cand not in attempted:
+                attempted.append(cand)
+            if cand.exists():
+                return cand.resolve(), attempted
+
+        # Fallback: Eğer aranan parkur12.hef / parkur3.hef bulunamadıysa yolov11s.hef dene
+        if filename != "yolov11s.hef":
+            fallback_filename = "yolov11s.hef"
+            for base_cand in list(candidates):
+                fb_cand = base_cand.parent / fallback_filename
+                if fb_cand not in attempted:
+                    attempted.append(fb_cand)
+                if fb_cand.exists():
+                    if self is not None:
+                        self.get_logger().info(
+                            f"[YOLO] '{filename}' yerine fallback model '{fallback_filename}' kullanılıyor: {fb_cand}"
+                        )
+                    return fb_cand.resolve(), attempted
+
+        return None, attempted
+
+    def _log_missing_model_error(self, model_key: str, raw_path_str: str, attempted_paths: list):
+        self.get_logger().error(f"[YOLO] '{model_key}' HEF modeli bulunamadı!")
+        self.get_logger().error(f"  İstenen Yol : {raw_path_str}")
+        self.get_logger().error("  Denenen Yollar:")
+        for idx, path_item in enumerate(attempted_paths, 1):
+            self.get_logger().error(f"    {idx}. {path_item}")
+
+    # =========================================================================
+    # Hailo Başlatma ve Pipeline Yönetimi
+    # =========================================================================
 
     def init_hailo(self):
-        model_path = Path(self.model_path).expanduser()
+        if not HAILO_AVAILABLE:
+            err_msg = f"hailo_platform kütüphanesi bulunamadı: {HAILO_IMPORT_ERROR}"
+            self.get_logger().fatal(f"[FATAL] {err_msg}")
+            self.get_logger().fatal("HailoRT kurulumunu ve venv/python environment'ı kontrol edin.")
+            raise RuntimeError(err_msg)
 
-        if not model_path.is_absolute():
-            # Improved model path resolution
-            current_file = Path(__file__).resolve()
-            package_dir = current_file.parent
-            workspace_src = package_dir.parents[2] # Go up to src/
-            
-            candidate_paths = [
-                model_path,
-                package_dir / self.model_path,
-                workspace_src / "albatros_system" / self.model_path,
-                Path.cwd() / self.model_path,
-                Path.cwd() / "src" / "albatros_system" / self.model_path,
-            ]
+        self.get_logger().info("Hailo VDevice oluşturuluyor...")
+        try:
+            self.vdevice = VDevice()
+        except Exception as exc:
+            self.get_logger().fatal(f"[FATAL] Hailo VDevice oluşturulamadı: {exc}")
+            raise RuntimeError(f"Hailo VDevice initialization failed: {exc}") from exc
 
-            for candidate in candidate_paths:
-                if candidate.exists():
-                    model_path = candidate
-                    break
+        # Parkur 1-2 Model Çözümleme
+        self.parkur12_resolved_path, p12_attempted = self.resolve_model_path(
+            self.parkur12_model_path_param, "parkur12"
+        )
+        if self.parkur12_resolved_path is None:
+            # Fallback legacy model_path
+            self.parkur12_resolved_path, legacy_attempted = self.resolve_model_path(
+                self.legacy_model_path_param, "legacy_model_path"
+            )
+            p12_attempted.extend(legacy_attempted)
 
-        if not model_path.exists():
-            raise FileNotFoundError(f"Hailo HEF model file not found: {model_path}")
+        if self.parkur12_resolved_path is not None:
+            self.parkur12_available = True
+        else:
+            self._log_missing_model_error("parkur12", self.parkur12_model_path_param, p12_attempted)
+            self.get_logger().fatal("[FATAL] YOLO başlatılamadı: hiçbir geçerli parkur12 HEF modeli bulunamadı.")
+            raise FileNotFoundError("No valid parkur12 HEF model found.")
 
-        self.get_logger().info(f"Loading Hailo HEF model: {model_path}")
+        # Parkur 3 Model Çözümleme
+        self.parkur3_resolved_path, p3_attempted = self.resolve_model_path(
+            self.parkur3_model_path_param, "parkur3"
+        )
+        if self.parkur3_resolved_path is not None:
+            self.parkur3_available = True
+        else:
+            self.parkur3_available = False
+            self.get_logger().warn(
+                f"[WARN] parkur3 HEF modeli bulunamadı ({self.parkur3_model_path_param}). "
+                "Parkur 1/2 modeli ile node çalışmaya devam ediyor. Parkur3 model switching pasif."
+            )
+
+        # İlk Başlangıç Modelini Yükle (parkur12)
+        self.load_hef_pipeline(self.parkur12_resolved_path, "parkur12")
+
+        # Startup Özeti Logla
+        self._print_startup_banner()
+
+    def _print_startup_banner(self):
+        banner = [
+            "============================================================",
+            "YOLO Hailo Node Başlatıldı (v4)",
+            "",
+            f"Input Image Topic      : {self.input_image_topic}",
+            f"Detection Output Topic : {self.detections_topic}",
+            f"Obstacles Output Topic : {self.obstacles_topic}",
+            f"Confidence Threshold   : {self.confidence_threshold:.2f}",
+            "",
+            f"Parkur12 HEF Model     : {self.parkur12_resolved_path}",
+            f"  AVAILABLE            : {self.parkur12_available}",
+            f"Parkur3 HEF Model      : {self.parkur3_resolved_path or 'YOK'}",
+            f"  AVAILABLE            : {self.parkur3_available}",
+            "",
+            f"Active Initial Model   : {self.active_model_name}",
+            f"Hailo VDevice Status   : READY",
+            f"Model Input Dimensions : {self.model_input_width}x{self.model_input_height}",
+            "============================================================"
+        ]
+        for line in banner:
+            self.get_logger().info(line)
+
+    def load_hef_pipeline(self, model_path: Path, model_key: str):
+        self.get_logger().info(f"[YOLO] Hailo HEF modeli yükleniyor ({model_key}): {model_path}")
         self.hef = HEF(str(model_path))
 
-        # Log HEF Input Info
         input_infos = self.hef.get_input_vstream_infos()
         for i, info in enumerate(input_infos):
             self.get_logger().info(f"HEF Input [{i}]: name={info.name}, shape={info.shape}, format={info.format}")
-            if i == 0:
-                # Update model input size dynamically if possible
-                if len(info.shape) >= 3:
-                    self.model_input_height = info.shape[1]
-                    self.model_input_width = info.shape[2]
-                    self.get_logger().info(f"Updated model dimensions from HEF: {self.model_input_width}x{self.model_input_height}")
+            if i == 0 and len(info.shape) >= 3:
+                self.model_input_height = int(info.shape[0])
+                self.model_input_width = int(info.shape[1])
+                self.get_logger().info(f"Girdi boyutları güncellendi: {self.model_input_width}x{self.model_input_height}")
 
-        # Log HEF Output Info
         output_infos = self.hef.get_output_vstream_infos()
         for i, info in enumerate(output_infos):
             self.get_logger().info(f"HEF Output [{i}]: name={info.name}, shape={info.shape}, format={info.format}")
 
-        self.get_logger().info("Creating VDevice...")
-        self.vdevice = VDevice()
-
-        # Use PCIe interface specifically for Raspberry Pi AI Kit
-        self.get_logger().info("Configuring HEF on VDevice with PCIe interface...")
         configure_params = ConfigureParams.create_from_hef(hef=self.hef, interface=HailoStreamInterface.PCIe)
         self.network_group = self.vdevice.configure(self.hef, configure_params)[0]
         self.network_group_params = self.network_group.create_params()
 
-        # Input/Output params
-        # UNVERIFIED: Keeping quantized=False, format=UINT8/FLOAT32 based on previous setup. 
-        # MUST BE VERIFIED with working Hailo test script.
         self.input_vstreams_params = InputVStreamParams.make_from_network_group(
             self.network_group, quantized=False, format_type=FormatType.UINT8
         )
         self.output_vstreams_params = OutputVStreamParams.make_from_network_group(
             self.network_group, quantized=False, format_type=FormatType.FLOAT32
         )
-        
-        self.get_logger().info("Creating InferVStreams pipeline...")
-        # Create the pipeline once
+
         self.infer_pipeline = InferVStreams(self.network_group, self.input_vstreams_params, self.output_vstreams_params)
-        
-        # We manually enter the context managers so they stay alive
         self.activation_context = self.network_group.activate(self.network_group_params)
         self.activation_context.__enter__()
         self.infer_pipeline.__enter__()
 
-        self.get_logger().info("Hailo node inference pipeline is ready.")
+        self.active_model_name = model_key
+        self.get_logger().info(f"[YOLO] Hailo inference pipeline hazır. Aktif model: '{self.active_model_name}'.")
+
+    def _cleanup_hailo_pipeline(self):
+        """Pipeline ve activation kaynaklarını güvenli şekilde serbest bırakır (Idempotent)."""
+        if self.infer_pipeline is not None:
+            try:
+                self.infer_pipeline.__exit__(None, None, None)
+            except Exception as e:
+                self.get_logger().warn(f"[YOLO] infer_pipeline kapatılırken uyarı: {e}")
+            self.infer_pipeline = None
+
+        if self.activation_context is not None:
+            try:
+                self.activation_context.__exit__(None, None, None)
+            except Exception as e:
+                self.get_logger().warn(f"[YOLO] activation_context kapatılırken uyarı: {e}")
+            self.activation_context = None
+
+    def switch_hailo_model(self, requested_model: str):
+        """
+        Thread-safe model switching.
+        Parkur değiştiğinde model switch yapar. Hedef model yoksa mevcut modeli bozmaz.
+        """
+        if requested_model == self.active_model_name:
+            return
+
+        with self.inference_lock:
+            if requested_model == self.active_model_name:
+                return
+
+            target_path = (
+                self.parkur3_resolved_path if requested_model == "parkur3" else self.parkur12_resolved_path
+            )
+
+            if target_path is None or not target_path.exists():
+                self.get_logger().warn(
+                    f"[YOLO] Model değiştirilemedi: '{requested_model}' için HEF dosyası bulunamadı. "
+                    f"Mevcut '{self.active_model_name}' modeli ile devam ediliyor."
+                )
+                return
+
+            self.get_logger().info(f"[YOLO] Parkur değişimi algılandı. Model değiştiriliyor: {self.active_model_name} -> {requested_model}")
+
+            # Eski pipeline'ı kapat
+            self._cleanup_hailo_pipeline()
+
+            try:
+                self.load_hef_pipeline(target_path, requested_model)
+                self.get_logger().info(f"[YOLO] Model değişimi tamamlandı. Aktif model: {self.active_model_name}")
+                self._publish_status()
+            except Exception as e:
+                self.get_logger().error(f"[YOLO] '{requested_model}' modeline geçiş başarısız oldu: {e}")
+                # Eski çalışan modele geri dönmeyi dene
+                if self.parkur12_resolved_path is not None and requested_model != "parkur12":
+                    self.get_logger().info("[YOLO] Güvenli geri dönme: 'parkur12' modeline geçiliyor...")
+                    try:
+                        self.load_hef_pipeline(self.parkur12_resolved_path, "parkur12")
+                    except Exception as e2:
+                        self.get_logger().fatal(f"[FATAL] Fallback model de yüklenemedi: {e2}")
+
+    # =========================================================================
+    # Mission Status / Vehicle State Callback'leri
+    # =========================================================================
+
+    def _evaluate_model_switch_request(self, current_parkur: int, mission_state_str: str):
+        mission_state_upper = str(mission_state_str).upper()
+
+        if current_parkur == 3 or "PARKUR3" in mission_state_upper or "PARKUR_3" in mission_state_upper:
+            target_model = "parkur3"
+        else:
+            target_model = "parkur12"
+
+        if target_model != self.active_model_name:
+            now = time.time()
+            if target_model != self.pending_requested_model:
+                self.pending_requested_model = target_model
+                self.last_model_switch_request_time = now
+            elif now - self.last_model_switch_request_time >= self.model_switch_debounce_sec:
+                self.switch_hailo_model(target_model)
+
+    def mission_status_callback(self, msg):
+        self._evaluate_model_switch_request(msg.current_parkur, msg.mission_state)
+
+    def vehicle_state_callback(self, msg):
+        self._evaluate_model_switch_request(msg.current_parkur, msg.mission_state)
+
+    # =========================================================================
+    # Görsel & Inference İşleme Döngüsü
+    # =========================================================================
 
     def ros_image_to_cv2(self, msg: Image):
         data = np.frombuffer(msg.data, dtype=np.uint8)
@@ -224,11 +502,21 @@ class YoloNode(Node):
             frame = data.reshape((msg.height, msg.step))
             frame = frame[:, :msg.width]
             frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        elif msg.encoding in ["bgra8", "BGRA8"]:
+            frame = data.reshape((msg.height, msg.step))
+            frame = frame[:, :msg.width * 4]
+            frame = frame.reshape((msg.height, msg.width, 4))
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+        elif msg.encoding in ["rgba8", "RGBA8"]:
+            frame = data.reshape((msg.height, msg.step))
+            frame = frame[:, :msg.width * 4]
+            frame = frame.reshape((msg.height, msg.width, 4))
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
         else:
             frame = data.reshape((msg.height, msg.step))
             frame = frame[:, :msg.width * 3]
             frame = frame.reshape((msg.height, msg.width, 3))
-            if msg.encoding == "rgb8" or msg.encoding == "RGB8":
+            if msg.encoding in ["rgb8", "RGB8"]:
                 frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         return np.ascontiguousarray(frame)
 
@@ -236,7 +524,7 @@ class YoloNode(Node):
         try:
             frame = self.ros_image_to_cv2(msg)
         except Exception as exc:
-            self.get_logger().error(f"Image conversion error: {exc}", throttle_duration_sec=2.0)
+            self.get_logger().error(f"Görüntü dönüştürme hatası: {exc}", throttle_duration_sec=2.0)
             return
 
         stamp_sec = msg.header.stamp.sec
@@ -246,7 +534,6 @@ class YoloNode(Node):
             now_msg = self.get_clock().now().to_msg()
             stamp_float = now_msg.sec + now_msg.nanosec * 1e-9
 
-        # Update latest frame and notify worker
         with self.frame_lock:
             self.latest_frame = frame
             self.latest_stamp = stamp_float
@@ -257,18 +544,19 @@ class YoloNode(Node):
         while self.running and rclpy.ok():
             if not self.frame_event.wait(timeout=0.1):
                 continue
-            
+
             self.frame_event.clear()
-            
+
             with self.frame_lock:
                 if self.latest_frame is None:
                     continue
                 frame = self.latest_frame.copy()
                 stamp = self.latest_stamp
                 input_msg = self.latest_msg
-            
+
             try:
-                processed_frame, detections = self.run_yolo(frame, stamp)
+                with self.inference_lock:
+                    processed_frame, detections = self.run_yolo(frame, stamp)
 
                 if self.draw_timestamp:
                     self.draw_time_label(processed_frame, stamp)
@@ -277,40 +565,46 @@ class YoloNode(Node):
                 self.publish_detections(detections, stamp, input_msg.header.frame_id)
                 self.publish_obstacle_candidates(detections, stamp)
                 self.write_video(processed_frame)
+                self._last_inference_ok = True
             except Exception as e:
-                self.get_logger().error(f"Inference error: {e}", throttle_duration_sec=2.0)
+                self._last_inference_ok = False
+                self.get_logger().error(f"Inference hatası: {e}", throttle_duration_sec=2.0)
 
     def preprocess_frame(self, frame):
-        # UNVERIFIED: Needs verification from working Hailo test script.
         ih, iw = frame.shape[:2]
         h, w = self.model_input_height, self.model_input_width
-        
+
         scale = min(w / iw, h / ih)
         nw, nh = int(iw * scale), int(ih * scale)
         resized = cv2.resize(frame, (nw, nh))
-        
+
         canvas = np.full((h, w, 3), 128, dtype=np.uint8)
         dx, dy = (w - nw) // 2, (h - nh) // 2
-        canvas[dy:dy+nh, dx:dx+nw] = resized
-        
-        # Assumed RGB based on original script, but may need to be BGR
+        canvas[dy:dy + nh, dx:dx + nw] = resized
+
         canvas_rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
-        
+
         self._preprocess_scale = scale
         self._preprocess_dx = dx
         self._preprocess_dy = dy
         self._original_size = (iw, ih)
-        
+
         return canvas_rgb
 
     def run_yolo(self, frame, stamp_float):
         processed = frame.copy()
         detections = []
-        
+
         if self.infer_pipeline is None:
             return processed, detections
-            
+
         input_frame = self.preprocess_frame(frame)
+        if not self._first_frame_logged:
+            self.get_logger().info(
+                f"İlk frame verisi: shape={input_frame.shape}, dtype={input_frame.dtype}, nbytes={input_frame.nbytes}"
+            )
+            self._first_frame_logged = True
+
         input_name = self.hef.get_input_vstream_infos()[0].name
         input_data = {
             input_name: np.expand_dims(input_frame, axis=0)
@@ -336,38 +630,49 @@ class YoloNode(Node):
         return processed, detections
 
     def postprocess_results(self, results, stamp_float):
-        # UNVERIFIED: This parser is kept from the original script.
-        # It must be validated with the actual working Hailo NMS format.
+        """
+        Hailo çıkışlarını okur ve GLOBAL confidence eşiğini (>= 0.30) uygular.
+        """
         detections = []
         scale = self._preprocess_scale
         dx = self._preprocess_dx
         dy = self._preprocess_dy
         orig_w, orig_h = self._original_size
-        
+
         nms_output = None
         for info in self.hef.get_output_vstream_infos():
             out_tensor = results[info.name][0]
             if "nms" in info.name.lower() or out_tensor.shape[-1] == 6:
                 nms_output = out_tensor
                 break
-        
+
         if nms_output is None and len(self.hef.get_output_vstream_infos()) > 0:
             info = self.hef.get_output_vstream_infos()[0]
             out_tensor = results[info.name][0]
             if out_tensor.shape[-1] == 6:
                 nms_output = out_tensor
 
+        class_map = self.class_mappings.get(self.active_model_name, self.class_mappings["parkur12"])
+
         if nms_output is not None:
             for box in nms_output:
                 if len(box) >= 6:
                     ymin, xmin, ymax, xmax, confidence, class_id = box[:6]
-                    
+
+                    # Global 0.30 Confidence Filtresi
                     if confidence < self.confidence_threshold:
                         continue
-                    
+
                     class_id = int(class_id)
-                    class_name = self.class_names.get(class_id, str(class_id))
-                    
+                    if class_id in class_map:
+                        class_name = class_map[class_id]
+                    else:
+                        self.get_logger().warn(
+                            f"[WARN] Bilinmeyen class_id={class_id} (Aktif model: '{self.active_model_name}')",
+                            throttle_duration_sec=5.0
+                        )
+                        class_name = f"unknown_{class_id}"
+
                     if xmax <= 1.0 and ymax <= 1.0:
                         xmin_px = xmin * self.model_input_width
                         xmax_px = xmax * self.model_input_width
@@ -375,36 +680,37 @@ class YoloNode(Node):
                         ymax_px = ymax * self.model_input_height
                     else:
                         xmin_px, ymin_px, xmax_px, ymax_px = xmin, ymin, xmax, ymax
-                        
+
                     x1 = int((xmin_px - dx) / scale)
                     y1 = int((ymin_px - dy) / scale)
                     x2 = int((xmax_px - dx) / scale)
                     y2 = int((ymax_px - dy) / scale)
-                    
+
                     x1 = max(0, min(x1, orig_w - 1))
                     y1 = max(0, min(y1, orig_h - 1))
                     x2 = max(0, min(x2, orig_w - 1))
                     y2 = max(0, min(y2, orig_h - 1))
-                    
+
                     if x1 > x2:
                         x1, x2 = x2, x1
                     if y1 > y2:
                         y1, y2 = y2, y1
-                    
+
                     width = int(x2 - x1)
                     height = int(y2 - y1)
-                    
+
                     if width <= 0 or height <= 0:
                         continue
-                    
+
                     cx = int((x1 + x2) / 2)
                     cy = int((y1 + y2) / 2)
-                    
+
                     detection = {
                         "stamp": stamp_float,
                         "class_id": class_id,
                         "class_name": class_name,
                         "confidence": float(confidence),
+                        "model_active": self.active_model_name,
                         "bbox": {
                             "x_min": x1,
                             "y_min": y1,
@@ -421,20 +727,20 @@ class YoloNode(Node):
                     detections.append(detection)
         else:
             self.get_logger().warn(
-                "NMS output format mismatch. Ensure HEF was compiled with nms_postprocess.", 
+                "NMS output format mismatch. Ensure HEF format is supported.",
                 throttle_duration_sec=5.0
             )
 
         return detections
 
     def draw_detection(self, frame, x1, y1, x2, y2, cx, cy, class_name, confidence):
-        label = f"{class_name} {confidence:.2f}"
+        label = f"{class_name} {confidence:.2f} [{self.active_model_name}]"
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        text_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        text_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
         text_w, text_h = text_size
         label_y1 = max(y1 - text_h - 8, 0)
         cv2.rectangle(frame, (x1, label_y1), (x1 + text_w + 8, label_y1 + text_h + 8), (0, 255, 0), -1)
-        cv2.putText(frame, label, (x1 + 4, label_y1 + text_h + 3), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
+        cv2.putText(frame, label, (x1 + 4, label_y1 + text_h + 3), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2, cv2.LINE_AA)
 
         if self.draw_center:
             cv2.circle(frame, (cx, cy), 4, (0, 0, 255), -1)
@@ -442,7 +748,7 @@ class YoloNode(Node):
 
     def draw_time_label(self, frame, stamp_float):
         dt_text = datetime.fromtimestamp(stamp_float).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-        label = f"stamp: {stamp_float:.3f} | {dt_text}"
+        label = f"stamp: {stamp_float:.3f} | model: {self.active_model_name} | {dt_text}"
         cv2.rectangle(frame, (8, 8), (620, 38), (0, 0, 0), -1)
         cv2.putText(frame, label, (15, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
 
@@ -476,6 +782,7 @@ class YoloNode(Node):
         payload = {
             "stamp": stamp_float,
             "frame_id": frame_id or "camera_frame",
+            "active_model": self.active_model_name,
             "detection_count": len(detections),
             "detections": detections
         }
@@ -512,12 +819,33 @@ class YoloNode(Node):
         payload = {
             "stamp": stamp_float,
             "source": "yolo_node",
+            "active_model": self.active_model_name,
             "obstacle_count": len(obstacles),
             "obstacles": obstacles
         }
         msg = String()
         msg.data = json.dumps(payload, ensure_ascii=False)
         self.obstacles_pub.publish(msg)
+
+    def _publish_status(self):
+        now = time.time()
+        if now - self._last_status_pub_time < 0.5:
+            return
+        self._last_status_pub_time = now
+
+        payload = {
+            "ready": HAILO_AVAILABLE and self.infer_pipeline is not None,
+            "hailo_ready": HAILO_AVAILABLE,
+            "active_model": self.active_model_name,
+            "parkur12_available": self.parkur12_available,
+            "parkur3_available": self.parkur3_available,
+            "confidence_threshold": self.confidence_threshold,
+            "last_inference_ok": self._last_inference_ok,
+        }
+
+        msg = String()
+        msg.data = json.dumps(payload, ensure_ascii=False)
+        self.status_pub.publish(msg)
 
     def write_video(self, frame):
         if not self.save_video:
@@ -530,7 +858,7 @@ class YoloNode(Node):
             try:
                 self.video_writer.write(frame)
             except Exception as e:
-                self.get_logger().error(f"Failed to write video frame: {e}", throttle_duration_sec=5.0)
+                self.get_logger().error(f"Video yazma hatası: {e}", throttle_duration_sec=5.0)
 
     def init_video_writer(self, frame):
         try:
@@ -540,59 +868,48 @@ class YoloNode(Node):
             height, width = frame.shape[:2]
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             self.video_writer = cv2.VideoWriter(str(self.video_path), fourcc, self.video_fps, (width, height))
-            
+
             if not self.video_writer.isOpened():
-                self.get_logger().error(f"Could not open video writer: {self.video_path}")
+                self.get_logger().error(f"Video yazar açılamadı: {self.video_path}")
                 self.video_writer = None
             else:
-                self.get_logger().info(f"Recording processed video: {self.video_path}")
+                self.get_logger().info(f"Video kaydı başlatıldı: {self.video_path}")
         except Exception as e:
-            self.get_logger().error(f"Error initializing video writer: {e}")
+            self.get_logger().error(f"Video yazar başlatma hatası: {e}")
             self.video_writer = None
 
     def destroy_node(self):
-        # 1. Stop the worker thread safely
         self.running = False
         self.frame_event.set()
-        if self.worker_thread.is_alive():
+        if hasattr(self, 'worker_thread') and self.worker_thread.is_alive():
             self.worker_thread.join(timeout=2.0)
 
-        # 2. Release Video Writer
         if self.video_writer is not None:
             self.video_writer.release()
-            self.get_logger().info(f"Video saved: {self.video_path}")
-            
-        # 3. Release Hailo Pipeline & Contexts
-        if self.infer_pipeline is not None:
-            try:
-                self.infer_pipeline.__exit__(None, None, None)
-            except Exception as e:
-                self.get_logger().warn(f"Error releasing infer_pipeline: {e}")
-                
-        if self.activation_context is not None:
-            try:
-                self.activation_context.__exit__(None, None, None)
-            except Exception as e:
-                self.get_logger().warn(f"Error releasing activation context: {e}")
-                
-        # 4. Release VDevice
+            self.get_logger().info(f"Video kaydedildi: {self.video_path}")
+
+        self._cleanup_hailo_pipeline()
+
         if self.vdevice is not None:
             try:
                 self.vdevice.release()
-                self.get_logger().info("Hailo VDevice released.")
+                self.get_logger().info("Hailo VDevice serbest bırakıldı.")
             except Exception as e:
-                self.get_logger().warn(f"Error releasing VDevice: {e}")
+                self.get_logger().warn(f"VDevice serbest bırakılırken uyarı: {e}")
 
         super().destroy_node()
 
 
+# ---------------------------------------------------------------------------
+# Entry Point
+# ---------------------------------------------------------------------------
 def main(args=None):
     rclpy.init(args=args)
-    
+
     try:
         node = YoloNode()
-    except RuntimeError as e:
-        print(f"[FATAL] Failed to initialize YOLO Node: {e}")
+    except (RuntimeError, FileNotFoundError) as e:
+        print(f"\n[FATAL] YOLO Node Başlatılamadı: {e}\n")
         rclpy.shutdown()
         return
 
@@ -602,7 +919,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

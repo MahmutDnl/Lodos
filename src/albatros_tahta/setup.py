@@ -16,6 +16,9 @@ setup(
         # Launch dosyalarını share dizinine kopyala
         (os.path.join('share', package_name, 'launch'),
             glob(os.path.join('launch', '*.launch.py'))),
+        # HEF model dosyalarını share/models dizinine kopyala
+        (os.path.join('share', package_name, 'models'),
+            glob(os.path.join('models', '*.hef'))),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -29,18 +32,20 @@ setup(
         ],
     },
     entry_points={
-    'console_scripts': [
-        'kamera_node = albatros_tahta.kamera_node:main',
-        'yolo_node = albatros_tahta.yolo_node:main',
-        'mesafe_sensor_node = albatros_tahta.mesafe_sensor_node:main',
-        'costmap_node = albatros_tahta.costmap_node:main',
-        'duba_fusion_node = albatros_tahta.duba_fusion_node:main',
-        'imu_node = albatros_tahta.imu_node:main',
-        'gps_node = albatros_tahta.gps_node:main',
-        'kontrol_node = albatros_tahta.kontrol_node:main',
-        'mission_node = albatros_tahta.mission_node:main',
-        'state_node = albatros_tahta.state_node:main',
-        'karar_node = albatros_tahta.karar_node:main',
-    ],
+        'console_scripts': [
+            'kamera_node = albatros_tahta.kamera_node:main',
+            'yolo_node = albatros_tahta.yolo_node:main',
+            'parkur3_target_node = albatros_tahta.parkur3_target_node:main',
+            'yolo_mesafe_node = albatros_tahta.yolo_mesafe_node:main',
+            'mesafe_sensor_node = albatros_tahta.mesafe_sensor_node:main',
+            'costmap_node = albatros_tahta.costmap_node:main',
+            'duba_fusion_node = albatros_tahta.duba_fusion_node:main',
+            'imu_node = albatros_tahta.imu_node:main',
+            'gps_node = albatros_tahta.gps_node:main',
+            'kontrol_node = albatros_tahta.kontrol_node:main',
+            'mission_node = albatros_tahta.mission_node:main',
+            'state_node = albatros_tahta.state_node:main',
+            'karar_node = albatros_tahta.karar_node:main',
+        ],
     }
 )

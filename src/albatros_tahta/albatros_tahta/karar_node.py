@@ -1,820 +1,395 @@
 #!/usr/bin/env python3
-"""
-obstacle_avoidance_node.py — LODOS Albatros VFH Karar Node'u
-=============================================================
-Tahtadaki mimari: State + Costmap → KARAR → KOMUT
+# =============================================================================
+# LODOS Albatros — VFH Karar Node (Karar & Engelden Kaçınma v4)
+# =============================================================================
+# Girişler:
+#   - /albatros/costmap/grid   [nav_msgs/OccupancyGrid] (base_link)
+#   - /albatros/costmap/valid  [std_msgs/Bool]
+#   - /albatros/state          [albatros_interfaces/VehicleState]
+#
+# Çıkışlar:
+#   - /albatros/command/cmd_vel   [geometry_msgs/Twist]
+#   - /albatros/avoidance/status  [std_msgs/String JSON]
+#   - /albatros/avoidance/path    [nav_msgs/Path] (base_link)
+#   - /albatros/avoidance/markers [visualization_msgs/MarkerArray]
+#
+# ROS2 Jazzy / Ubuntu 24.04
+# =============================================================================
 
-Bu node, state_node'un ürettiği VehicleState mesajı ve costmap_node'un
-ürettiği OccupancyGrid verisini kullanarak VFH (Vector Field Histogram)
-algoritmasıyla engelden kaçınma kararı üretir ve hız komutu yayınlar.
-
-Görev:
-  ✓ State ve Costmap verisini okur.
-  ✓ VFH algoritmasıyla en güvenli yönü hesaplar.
-  ✓ Hız komutu (cmd_vel) üretir.
-  ✗ Sensör verisi toplamaz (State'ten alır).
-  ✗ Quaternion parse yapmaz (State'ten yaw gelir).
-  ✗ Heading error hesaplamaz (State'ten gelir).
-  ✗ MAVROS'a doğrudan erişmez.
-
-VFH (Vector Field Histogram) Algoritması:
-  1. POLAR HİSTOGRAM: Costmap'i tarayarak araç etrafında her 5° sektördeki
-     engel yoğunluğunu hesapla (72 sektör × 360°).
-  2. DÜZLEŞTIRME: Komşu sektörler üzerinde kayar ortalama ile gürültü azalt.
-  3. İKİLİ HİSTOGRAM: Yoğunluk > eşik → BLOCKED, aksi → FREE.
-  4. VALLEY TESPİTİ: Ardışık FREE sektörleri bul; araç genişliğine uygun
-     olanları filtrele.
-  5. EN İYİ YÖN: Hedef yönüne, mevcut yöne ve önceki seçime en yakın
-     valley'i maliyet fonksiyonuyla seç.
-  6. HIZ KOMUTU: Seçilen yöne göre angular.z, engel yakınlığına göre
-     linear.x hesapla ve /albatros/command/cmd_vel'e yayınla.
-
-Veri Akışı (Tahtadaki mimari):
-  Girişler:
-    - /albatros/state           (VehicleState)   ← state_node
-    - /albatros/costmap/grid    (OccupancyGrid)  ← costmap_node
-    - /albatros/costmap/valid   (Bool)           ← costmap_node
-  Çıkışlar:
-    - /albatros/command/cmd_vel     (Twist)  → control_node
-    - /albatros/avoidance/status    (String) → Debug/YKİ (JSON)
-
-Koordinat Konvansiyonu:
-  Costmap (base_link):  +x = ileri (col artar), +y = sol (row artar)
-  VFH açı:              0° = ileri, +90° = sol, -90° (270°) = sağ  (CCW pozitif)
-  Pusula (compass):     0° = Kuzey, +90° = Doğu (CW pozitif)
-  Dönüşüm:              body_angle = -(heading_error_deg)
-
-Yazar : LODOS Takımı
-Araç  : Albatros İDA
-"""
-
-import math
 import json
+import math
 import time
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile
+from rclpy.qos import qos_profile_sensor_data
 
-from nav_msgs.msg import OccupancyGrid
-from geometry_msgs.msg import Twist
-from std_msgs.msg import Bool, String
+from geometry_msgs.msg import Twist, PoseStamped, Point
+from nav_msgs.msg import OccupancyGrid, Path
+from std_msgs.msg import String, Bool
+from visualization_msgs.msg import Marker, MarkerArray
 
 from albatros_interfaces.msg import VehicleState
 
 
-# ── Topic Tanımları ──────────────────────────────────────────────────────────
-STATE_TOPIC          = '/albatros/state'
-COSTMAP_GRID_TOPIC   = '/albatros/costmap/grid'
-COSTMAP_VALID_TOPIC  = '/albatros/costmap/valid'
-
-CMD_VEL_TOPIC          = '/albatros/command/cmd_vel'
-AVOIDANCE_STATUS_TOPIC = '/albatros/avoidance/status'
-
-# ── Varsayılan Parametreler ──────────────────────────────────────────────────
-DEFAULT_SECTOR_COUNT          = 72       # 360°/72 = 5° sektör genişliği
-DEFAULT_VFH_THRESHOLD         = 0.3      # Binary histogram eşiği (normalize)
-DEFAULT_ACTIVE_REGION_RADIUS  = 6.0      # VFH tarama yarıçapı (m)
-DEFAULT_VEHICLE_WIDTH         = 0.85     # Araç genişliği (m)
-DEFAULT_SAFETY_MARGIN         = 0.5      # Ek güvenlik marjı (m)
-DEFAULT_MAX_LINEAR_SPEED      = 1.0      # Maks ileri hız (m/s)
-DEFAULT_MIN_LINEAR_SPEED      = 0.2      # Min ileri hız (m/s)
-DEFAULT_MAX_ANGULAR_SPEED     = 0.8      # Maks dönüş hızı (rad/s)
-DEFAULT_COST_GOAL_WEIGHT      = 5.0      # μ₁: Hedef yönüne yakınlık ağırlığı
-DEFAULT_COST_CURRENT_WEIGHT   = 2.0      # μ₂: Mevcut heading ağırlığı
-DEFAULT_COST_PREVIOUS_WEIGHT  = 2.0      # μ₃: Önceki seçim ağırlığı
-DEFAULT_SLOWDOWN_DISTANCE     = 2.0      # Engel yakınlaşınca yavaşlama mesafesi (m)
-DEFAULT_PUBLISH_RATE          = 10.0     # Komut yayın frekansı (Hz)
-DEFAULT_COSTMAP_TIMEOUT       = 2.0      # Costmap timeout (s)
-DEFAULT_STATE_TIMEOUT         = 2.0      # State timeout (s)
-DEFAULT_SMOOTHING_WINDOW      = 5        # Histogram düzleştirme penceresi (sektör)
-DEFAULT_STEERING_KP           = 1.5      # PID oransal kazanç (yön kontrolü)
-
-# ── Costmap Maliyet Sabitleri ────────────────────────────────────────────────
-COST_UNKNOWN  = -1
-COST_FREE     = 0
-COST_LETHAL   = 100
-
-
 class ObstacleAvoidanceNode(Node):
     """
-    VFH (Vector Field Histogram) tabanlı karar ve komut ROS2 node'u.
-
-    State node'dan araç durumu (hedef, yaw, heading error, güvenlik),
-    Costmap node'dan engel haritası alarak VFH ile en güvenli yönü
-    hesaplar ve hız komutu üretir.
+    VFH (Vector Field Histogram) tabanlı engel kaçınma node'u.
+    Girdi olarak base_link frame'indeki yerel costmap'i alır.
     """
 
     def __init__(self):
-        super().__init__('obstacle_avoidance_node')
+        super().__init__('karar_node')
 
-        # ─── Parametre Tanımları ─────────────────────────────────────────
-        self.declare_parameter('sector_count',          DEFAULT_SECTOR_COUNT)
-        self.declare_parameter('vfh_threshold',         DEFAULT_VFH_THRESHOLD)
-        self.declare_parameter('active_region_radius_m', DEFAULT_ACTIVE_REGION_RADIUS)
-        self.declare_parameter('vehicle_width_m',       DEFAULT_VEHICLE_WIDTH)
-        self.declare_parameter('safety_margin_m',       DEFAULT_SAFETY_MARGIN)
-        self.declare_parameter('max_linear_speed',      DEFAULT_MAX_LINEAR_SPEED)
-        self.declare_parameter('min_linear_speed',      DEFAULT_MIN_LINEAR_SPEED)
-        self.declare_parameter('max_angular_speed',     DEFAULT_MAX_ANGULAR_SPEED)
-        self.declare_parameter('cost_goal_weight',      DEFAULT_COST_GOAL_WEIGHT)
-        self.declare_parameter('cost_current_weight',   DEFAULT_COST_CURRENT_WEIGHT)
-        self.declare_parameter('cost_previous_weight',  DEFAULT_COST_PREVIOUS_WEIGHT)
-        self.declare_parameter('slowdown_distance_m',   DEFAULT_SLOWDOWN_DISTANCE)
-        self.declare_parameter('publish_rate',          DEFAULT_PUBLISH_RATE)
-        self.declare_parameter('costmap_timeout_sec',   DEFAULT_COSTMAP_TIMEOUT)
-        self.declare_parameter('state_timeout_sec',     DEFAULT_STATE_TIMEOUT)
-        self.declare_parameter('smoothing_window',      DEFAULT_SMOOTHING_WINDOW)
-        self.declare_parameter('steering_kp',           DEFAULT_STEERING_KP)
+        # ─── Parametreler ───────────────────────────────────────────────────
+        self.declare_parameter('sector_count',               72)
+        self.declare_parameter('vfh_threshold',              0.35)
+        self.declare_parameter('active_region_radius',       6.0)
+        self.declare_parameter('vehicle_width',              0.85)
+        self.declare_parameter('safety_margin',              0.50)
+        self.declare_parameter('max_linear_speed',           1.0)
+        self.declare_parameter('min_linear_speed',           0.2)
+        self.declare_parameter('max_angular_speed',          0.8)
+        self.declare_parameter('cost_goal_weight',           5.0)
+        self.declare_parameter('cost_current_weight',        2.0)
+        self.declare_parameter('cost_previous_weight',       2.0)
+        self.declare_parameter('cost_clearance_weight',      3.0)
+        self.declare_parameter('slowdown_distance',          2.0)
+        self.declare_parameter('emergency_stop_distance_m',  1.0)
+        self.declare_parameter('unknown_is_blocked',         False)
+        self.declare_parameter('steering_kp',                1.5)
+        self.declare_parameter('publish_rate',               10.0)
+        self.declare_parameter('costmap_timeout_sec',        1.5)
+        self.declare_parameter('state_timeout_sec',          2.0)
 
-        # ─── Parametre Okuma ─────────────────────────────────────────────
-        self._sector_count    = int(self.get_parameter('sector_count').value)
-        self._vfh_threshold   = float(self.get_parameter('vfh_threshold').value)
-        self._active_radius   = float(self.get_parameter('active_region_radius_m').value)
-        self._vehicle_width   = float(self.get_parameter('vehicle_width_m').value)
-        self._safety_margin   = float(self.get_parameter('safety_margin_m').value)
-        self._max_linear      = float(self.get_parameter('max_linear_speed').value)
-        self._min_linear      = float(self.get_parameter('min_linear_speed').value)
-        self._max_angular     = float(self.get_parameter('max_angular_speed').value)
-        self._mu_goal         = float(self.get_parameter('cost_goal_weight').value)
-        self._mu_current      = float(self.get_parameter('cost_current_weight').value)
-        self._mu_previous     = float(self.get_parameter('cost_previous_weight').value)
-        self._slowdown_dist   = float(self.get_parameter('slowdown_distance_m').value)
-        self._publish_rate    = float(self.get_parameter('publish_rate').value)
-        self._costmap_timeout = float(self.get_parameter('costmap_timeout_sec').value)
-        self._state_timeout   = float(self.get_parameter('state_timeout_sec').value)
-        self._smooth_window   = int(self.get_parameter('smoothing_window').value)
-        self._steering_kp     = float(self.get_parameter('steering_kp').value)
+        self._sector_count       = int(self.get_parameter('sector_count').value)
+        self._vfh_threshold      = float(self.get_parameter('vfh_threshold').value)
+        self._active_radius      = float(self.get_parameter('active_region_radius').value)
+        self._vehicle_width      = float(self.get_parameter('vehicle_width').value)
+        self._safety_margin      = float(self.get_parameter('safety_margin').value)
+        self._max_linear         = float(self.get_parameter('max_linear_speed').value)
+        self._min_linear         = float(self.get_parameter('min_linear_speed').value)
+        self._max_angular        = float(self.get_parameter('max_angular_speed').value)
+        self._weight_goal        = float(self.get_parameter('cost_goal_weight').value)
+        self._weight_current     = float(self.get_parameter('cost_current_weight').value)
+        self._weight_previous    = float(self.get_parameter('cost_previous_weight').value)
+        self._weight_clearance   = float(self.get_parameter('cost_clearance_weight').value)
+        self._slowdown_dist      = float(self.get_parameter('slowdown_distance').value)
+        self._emergency_dist     = float(self.get_parameter('emergency_stop_distance_m').value)
+        self._unknown_blocked    = bool(self.get_parameter('unknown_is_blocked').value)
+        self._steering_kp        = float(self.get_parameter('steering_kp').value)
+        self._publish_rate       = float(self.get_parameter('publish_rate').value)
+        self._costmap_timeout    = float(self.get_parameter('costmap_timeout_sec').value)
+        self._state_timeout      = float(self.get_parameter('state_timeout_sec').value)
 
-        # Türetilmiş sabitler
-        self._sector_width = 360.0 / self._sector_count
-        self._total_clearance = self._vehicle_width + 2.0 * self._safety_margin
+        self._sector_width       = 360.0 / self._sector_count
 
-        # ─── Dahili Durum Değişkenleri ───────────────────────────────────
-
-        # Costmap verisi
-        self._latest_costmap    = None
-        self._costmap_valid     = False
+        # ─── Dahili Durum ───────────────────────────────────────────────────
+        self._latest_costmap: OccupancyGrid = None
         self._last_costmap_time = None
+        self._costmap_valid     = False
 
-        # State verisi (VehicleState mesajından)
-        self._latest_state     = None
-        self._last_state_time  = None
+        self._latest_state: VehicleState = None
+        self._last_state_time   = None
 
-        # VFH durum
-        self._previous_selected_sector = 0
-        self._histogram         = [0.0] * self._sector_count
-        self._binary_histogram  = [0] * self._sector_count
-        self._min_obstacle_dist = [self._active_radius] * self._sector_count
-
-        # İstatistikler
+        self._prev_selected_sector = 0
+        self._smoothed_angle_deg   = 0.0
         self._total_commands_sent = 0
         self._total_stops         = 0
-        self._last_status_time    = 0.0
+        self._last_status_pub_time = 0.0
 
-        # ─── QoS Profilleri ──────────────────────────────────────────────
-        default_qos = QoSProfile(depth=10)
-
-        # ─── Subscriber'lar ──────────────────────────────────────────────
-        # State node'dan birleşik araç durumu
-        self._sub_state = self.create_subscription(
-            VehicleState,
-            STATE_TOPIC,
-            self._cb_state,
-            default_qos,
-        )
-
-        # Costmap node'dan engel haritası
+        # ─── Subscriber'lar ────────────────────────────────────────────────
         self._sub_costmap = self.create_subscription(
-            OccupancyGrid,
-            COSTMAP_GRID_TOPIC,
-            self._cb_costmap,
-            default_qos,
-        )
+            OccupancyGrid, '/albatros/costmap/grid', self._cb_costmap, qos_profile_sensor_data)
 
-        # Costmap geçerlilik durumu
         self._sub_costmap_valid = self.create_subscription(
-            Bool,
-            COSTMAP_VALID_TOPIC,
-            self._cb_costmap_valid,
-            default_qos,
-        )
+            Bool, '/albatros/costmap/valid', self._cb_costmap_valid, 10)
 
-        # ─── Publisher'lar ───────────────────────────────────────────────
-        self._pub_cmd_vel = self.create_publisher(
-            Twist,
-            CMD_VEL_TOPIC,
-            default_qos,
-        )
+        self._sub_state = self.create_subscription(
+            VehicleState, '/albatros/state', self._cb_state, 10)
 
-        self._pub_status = self.create_publisher(
-            String,
-            AVOIDANCE_STATUS_TOPIC,
-            default_qos,
-        )
+        # ─── Publisher'lar ─────────────────────────────────────────────────
+        self._pub_cmd_vel = self.create_publisher(Twist,        '/albatros/command/cmd_vel', 10)
+        self._pub_status  = self.create_publisher(String,       '/albatros/avoidance/status', 10)
+        self._pub_path    = self.create_publisher(Path,         '/albatros/avoidance/path',   10)
+        self._pub_markers = self.create_publisher(MarkerArray,  '/albatros/avoidance/markers', 10)
 
-        # ─── Ana Timer ──────────────────────────────────────────────────
-        period_sec = 1.0 / max(self._publish_rate, 0.1)
-        self._timer = self.create_timer(period_sec, self._timer_callback)
+        # ─── Timer ─────────────────────────────────────────────────────────
+        period = 1.0 / max(self._publish_rate, 0.1)
+        self._timer = self.create_timer(period, self._control_loop)
 
-        # ─── Başlatma Bilgi Logları ──────────────────────────────────────
-        self.get_logger().info('=' * 64)
-        self.get_logger().info('VFH Karar Node başlatıldı.')
-        self.get_logger().info(f'  Sektör sayısı      : {self._sector_count} ({self._sector_width:.1f}°)')
-        self.get_logger().info(f'  VFH eşik           : {self._vfh_threshold}')
-        self.get_logger().info(f'  Tarama yarıçapı    : {self._active_radius} m')
-        self.get_logger().info(f'  Araç genişliği     : {self._vehicle_width} m')
-        self.get_logger().info(f'  Güvenlik marjı     : {self._safety_margin} m')
-        self.get_logger().info(f'  Toplam açıklık     : {self._total_clearance:.2f} m')
-        self.get_logger().info(f'  Maks hız           : {self._max_linear} m/s')
-        self.get_logger().info(f'  Maks dönüş hızı    : {self._max_angular} rad/s')
-        self.get_logger().info(f'  Yayın frekansı     : {self._publish_rate} Hz')
-        self.get_logger().info(f'  State girişi       : {STATE_TOPIC}')
-        self.get_logger().info(f'  Costmap girişi     : {COSTMAP_GRID_TOPIC}')
-        self.get_logger().info(f'  Komut çıkışı       : {CMD_VEL_TOPIC}')
-        self.get_logger().info('=' * 64)
+        self.get_logger().info('=' * 60)
+        self.get_logger().info('VFH Karar Node (v4) Başlatıldı.')
+        self.get_logger().info(f'  Sektör Sayısı  : {self._sector_count} ({self._sector_width:.1f}°/sektör)')
+        self.get_logger().info(f'  Acil Stop Eşiği: {self._emergency_dist} m')
+        self.get_logger().info('=' * 60)
 
-    # =====================================================================
+    # =========================================================================
     # Callback'ler
-    # =====================================================================
-
-    def _cb_state(self, msg: VehicleState):
-        """
-        /albatros/state callback'i.
-        State node'dan gelen birleşik araç durumu mesajını saklar.
-        Heading error, yaw, hedef bilgisi, güvenlik durumu vb. hepsi
-        bu tek mesajın içindedir.
-        """
-        self._latest_state = msg
-        self._last_state_time = self.get_clock().now()
+    # =========================================================================
 
     def _cb_costmap(self, msg: OccupancyGrid):
-        """
-        /albatros/costmap/grid callback'i.
-        OccupancyGrid verisini saklar ve zaman damgasını günceller.
-        """
         self._latest_costmap = msg
         self._last_costmap_time = self.get_clock().now()
 
     def _cb_costmap_valid(self, msg: Bool):
-        """
-        /albatros/costmap/valid callback'i.
-        Costmap'in geçerli olup olmadığını günceller.
-        """
         self._costmap_valid = msg.data
 
-    # =====================================================================
-    # Ana Timer Callback — VFH Pipeline
-    # =====================================================================
+    def _cb_state(self, msg: VehicleState):
+        self._latest_state = msg
+        self._last_state_time = self.get_clock().now()
 
-    def _timer_callback(self):
-        """
-        Ana kontrol döngüsü. VFH pipeline'ını çalıştırır:
-        1. Veri tazeliği ve güvenlik kontrolü (State + Costmap)
-        2. Polar histogram oluşturma
-        3. Düzleştirme + binary histogram
-        4. Valley tespiti
-        5. En iyi yön seçimi
-        6. Hız komutu üretimi ve yayını
-        """
-        # ── Adım 0: Veri geçerlilik ve güvenlik kontrolü ────────────────
-        data_ok, reason = self._check_data_validity()
+    # =========================================================================
+    # Ana Kontrol Döngüsü
+    # =========================================================================
 
-        if not data_ok:
+    def _control_loop(self):
+        valid, reason = self._check_data_validity()
+        if not valid:
             self._publish_stop()
-            self._publish_status(
-                active=False,
-                reason=reason,
-                selected_angle_deg=0.0,
-                linear_speed=0.0,
-                angular_speed=0.0,
-            )
+            self._publish_status(False, reason, 0.0, 0.0, 0.0)
             return
 
-        state   = self._latest_state
-        costmap = self._latest_costmap
+        # VFH Hesaplamaları
+        histogram, min_dist_per_sector = self._build_polar_histogram()
+        valleys = self._find_valleys(histogram)
+        valid_valleys = self._filter_narrow_valleys(valleys, min_dist_per_sector)
 
-        # ── Adım 1: Costmap'ten araç konumunu hesapla ───────────────────
-        resolution = costmap.info.resolution
-        width      = costmap.info.width
-        height     = costmap.info.height
-        origin_x   = costmap.info.origin.position.x
-        origin_y   = costmap.info.origin.position.y
-
-        # Araç grid pozisyonu: costmap_node araç merkezli grid oluşturur
-        vehicle_col = int(round(-origin_x / resolution - 0.5))
-        vehicle_row = int(round(-origin_y / resolution - 0.5))
-
-        # ── Adım 2: Hedef yönünü body frame'e dönüştür ──────────────────
-        # State'ten heading_error_deg zaten hesaplanmış gelir.
-        # Pusula: heading_error > 0 → hedef saat yönünde (sağ)
-        # Body frame: +angle = CCW = sol
-        # Dönüşüm: body_angle = -heading_error
-        goal_body_deg = -state.heading_error_deg
-        goal_sector   = self._angle_to_sector(goal_body_deg)
-
-        # ── Adım 3: Polar histogram oluştur ──────────────────────────────
-        histogram, min_dist_per_sector = self._build_polar_histogram(
-            costmap.data, width, height, resolution,
-            vehicle_col, vehicle_row,
-        )
-
-        # ── Adım 4: Düzleştirme ─────────────────────────────────────────
-        smoothed = self._smooth_histogram(histogram)
-
-        # ── Adım 5: Binary histogram ────────────────────────────────────
-        binary = self._build_binary_histogram(smoothed)
-
-        # Dahili durumu güncelle (debug için)
-        self._histogram        = smoothed
-        self._binary_histogram = binary
-        self._min_obstacle_dist = min_dist_per_sector
-
-        # ── Adım 6: Valley tespiti ──────────────────────────────────────
-        valleys = self._find_valleys(binary)
-
-        # ── Adım 7: Araç genişliğine göre valley filtreleme ─────────────
-        valid_valleys = self._filter_valleys_by_width(
-            valleys, min_dist_per_sector,
-        )
-
-        # ── Adım 8: En iyi yön seçimi ──────────────────────────────────
         if not valid_valleys:
-            # Hiçbir geçilebilir valley yok → DUR
+            # Geçerli vadi yoksa acil stop!
             self._publish_stop()
+            self._publish_status(True, 'NO_VALID_VALLEY', 0.0, 0.0, 0.0)
             self._total_stops += 1
-            self._publish_status(
-                active=True,
-                reason='NO_VALLEY_FOUND',
-                selected_angle_deg=0.0,
-                linear_speed=0.0,
-                angular_speed=0.0,
-                goal_sector=goal_sector,
-                valleys=valleys,
-                valid_valleys=valid_valleys,
-            )
-            self.get_logger().warn(
-                'VFH: Geçilebilir valley bulunamadı — araç durduruluyor.',
-                throttle_duration_sec=3.0,
-            )
             return
 
-        selected_sector = self._select_best_direction(
-            valid_valleys, goal_sector,
+        # Hedef Sektör (Body Frame)
+        goal_heading_deg = self._latest_state.heading_error_deg
+        goal_sector = self._angle_to_sector(goal_heading_deg)
+
+        # En İyi Sektörü Seç
+        selected_sector = self._select_best_sector(
+            valid_valleys, goal_sector, min_dist_per_sector
         )
 
-        self._previous_selected_sector = selected_sector
         selected_angle_deg = self._sector_to_angle(selected_sector)
 
-        # ── Adım 9: Hız komutu hesapla ──────────────────────────────────
-        # Engel yakınlığına göre hız ayarı
-        nearest_obstacle = self._find_nearest_obstacle_in_cone(
-            selected_sector, min_dist_per_sector,
+        # Hysteresis / Yön Yumuşatma (EMA)
+        diff = self._normalize_angle_180(selected_angle_deg - self._smoothed_angle_deg)
+        self._smoothed_angle_deg = self._normalize_angle_180(
+            self._smoothed_angle_deg + 0.35 * diff
         )
 
-        linear_speed, angular_speed = self._compute_cmd_vel(
-            selected_angle_deg, nearest_obstacle,
+        # Seçilen Yöndeki En Yakın Engel Mesafesi
+        nearest_obs_dist = self._find_nearest_obstacle_in_cone(
+            selected_sector, min_dist_per_sector
         )
 
-        # ── Adım 10: Yayınla ────────────────────────────────────────────
+        # Acil Durdurma Kontrolü (Emergency Stop)
+        if nearest_obs_dist <= self._emergency_dist:
+            self._publish_stop()
+            self._publish_status(
+                True, f'EMERGENCY_OBSTACLE_TOO_CLOSE ({nearest_obs_dist:.2f}m)',
+                self._smoothed_angle_deg, 0.0, 0.0
+            )
+            self._total_stops += 1
+            return
+
+        # Hız Komutları Hesapla (P Kontrol)
+        linear_speed, angular_speed = self._calculate_speeds(
+            self._smoothed_angle_deg, nearest_obs_dist
+        )
+
+        # Twist Komutu Yayınla
         cmd = Twist()
-        cmd.linear.x  = linear_speed
+        cmd.linear.x = linear_speed
         cmd.angular.z = angular_speed
         self._pub_cmd_vel.publish(cmd)
         self._total_commands_sent += 1
+        self._prev_selected_sector = selected_sector
 
-        # Debug status
-        self._publish_status(
-            active=True,
-            reason='VFH_ACTIVE',
-            selected_angle_deg=selected_angle_deg,
-            linear_speed=linear_speed,
-            angular_speed=angular_speed,
-            goal_sector=goal_sector,
-            selected_sector=selected_sector,
-            nearest_obstacle=nearest_obstacle,
-            valleys=valleys,
-            valid_valleys=valid_valleys,
+        # Görselleştirmeleri Yayınla
+        self._publish_path(self._smoothed_angle_deg, linear_speed)
+        self._publish_avoidance_markers(
+            self._smoothed_angle_deg, goal_heading_deg, nearest_obs_dist
         )
 
-    # =====================================================================
-    # VFH Adım 1: Polar Histogram Oluşturma
-    # =====================================================================
+        self._publish_status(
+            True, 'OK', self._smoothed_angle_deg, linear_speed, angular_speed,
+            goal_sector=goal_sector, selected_sector=selected_sector,
+            nearest_obstacle=nearest_obs_dist, valleys=valleys, valid_valleys=valid_valleys
+        )
 
-    def _build_polar_histogram(
-        self,
-        grid_data,
-        width: int,
-        height: int,
-        resolution: float,
-        vehicle_col: int,
-        vehicle_row: int,
-    ):
-        """
-        Costmap verisinden polar histogram oluşturur.
+    # =========================================================================
+    # VFH Algoritma Adımları
+    # =========================================================================
 
-        Her sektör için:
-        - Engel yoğunluğu (magnitude toplamı) hesaplanır.
-        - En yakın engel mesafesi takip edilir.
+    def _build_polar_histogram(self):
+        histogram = [0.0] * self._sector_count
+        min_dist_per_sector = [self._active_radius] * self._sector_count
 
-        Magnitude formülü (VFH standard):
-            m = (cost/100)² × (a - d)
-        burada:
-            cost  = hücre maliyet değeri [0, 100]
-            a     = active_region_radius
-            d     = hücre mesafesi (m)
+        costmap = self._latest_costmap
+        res = costmap.info.resolution
+        w = costmap.info.width
+        h = costmap.info.height
+        ox = costmap.info.origin.position.x
+        oy = costmap.info.origin.position.y
 
-        Yakın ve yüksek maliyetli hücreler daha çok katkı sağlar.
+        data = costmap.data
+        if not data:
+            return histogram, min_dist_per_sector
 
-        Args:
-            grid_data:   OccupancyGrid.data dizisi (row-major).
-            width:       Grid genişliği (hücre).
-            height:      Grid yüksekliği (hücre).
-            resolution:  Hücre çözünürlüğü (m).
-            vehicle_col: Araç sütunu.
-            vehicle_row: Araç satırı.
+        for r in range(h):
+            for c in range(w):
+                idx = r * w + c
+                cell_val = data[idx]
 
-        Returns:
-            (histogram, min_dist_per_sector) tuple'ı.
-            histogram: Her sektörün toplam magnitude değeri.
-            min_dist_per_sector: Her sektördeki en yakın engel mesafesi (m).
-        """
-        histogram     = [0.0] * self._sector_count
-        min_dist      = [self._active_radius] * self._sector_count
-        active_cells  = int(math.ceil(self._active_radius / resolution))
-
-        for dr in range(-active_cells, active_cells + 1):
-            for dc in range(-active_cells, active_cells + 1):
-                col = vehicle_col + dc
-                row = vehicle_row + dr
-
-                # Sınır kontrolü
-                if not (0 <= col < width and 0 <= row < height):
+                if cell_val == 0:
                     continue
 
-                # Hücre maliyetini oku
-                idx = row * width + col
-                cost = grid_data[idx]
+                if cell_val < 0:
+                    if not self._unknown_blocked:
+                        continue
+                    cost_factor = 0.5
+                else:
+                    cost_factor = cell_val / 100.0
 
-                # Sadece engel hücreleriyle ilgilen (FREE ve UNKNOWN atla)
-                if cost <= COST_FREE:
+                x_m = ox + (c + 0.5) * res
+                y_m = oy + (r + 0.5) * res
+
+                dist = math.hypot(x_m, y_m)
+                if dist < 0.05 or dist > self._active_radius:
                     continue
 
-                # Mesafe hesabı (metre)
-                dx = dc * resolution
-                dy = dr * resolution
-                dist = math.sqrt(dx * dx + dy * dy)
-
-                # Tarama yarıçapı dışındakileri atla
-                if dist > self._active_radius or dist < 0.01:
-                    continue
-
-                # Açı hesabı (body frame: 0°=ileri, +90°=sol)
-                angle_deg = math.degrees(math.atan2(dy, dx))
+                angle_deg = math.degrees(math.atan2(y_m, x_m))
                 sector = self._angle_to_sector(angle_deg)
 
-                # VFH magnitude: (cost/100)² × (active_radius - dist)
-                normalized_cost = cost / 100.0
-                decay = self._active_radius - dist
-                magnitude = normalized_cost * normalized_cost * decay
+                if dist < min_dist_per_sector[sector]:
+                    min_dist_per_sector[sector] = dist
 
-                histogram[sector] += magnitude
+                c_weight = cost_factor * cost_factor
+                d_weight = (self._active_radius - dist) / self._active_radius
+                d_weight = max(0.0, d_weight * d_weight)
 
-                # En yakın engel takibi
-                if dist < min_dist[sector]:
-                    min_dist[sector] = dist
+                histogram[sector] += c_weight * d_weight
 
-        # Histogramı normalize et: max değeri 1.0 olacak şekilde
-        max_val = max(histogram) if histogram else 1.0
-        if max_val > 0:
+        # Normalizasyon
+        max_val = max(histogram) if histogram else 0.0
+        if max_val > 0.0:
             histogram = [h / max_val for h in histogram]
 
-        return histogram, min_dist
+        return histogram, min_dist_per_sector
 
-    # =====================================================================
-    # VFH Adım 2: Histogram Düzleştirme
-    # =====================================================================
-
-    def _smooth_histogram(self, histogram):
-        """
-        Polar histograma kayar ortalama (moving average) uygular.
-
-        Dairesel histogram olduğu için wrap-around (sektör 0 ↔ N-1)
-        dikkate alınır.
-
-        Pencere boyutu: self._smooth_window (varsayılan 5 sektör).
-
-        Args:
-            histogram: Ham polar histogram (list of float).
-
-        Returns:
-            Düzleştirilmiş histogram (list of float).
-        """
-        n = len(histogram)
-        half_w = self._smooth_window // 2
-        smoothed = [0.0] * n
-
-        for k in range(n):
-            total = 0.0
-            count = 0
-            for offset in range(-half_w, half_w + 1):
-                idx = (k + offset) % n  # Dairesel wrap-around
-                total += histogram[idx]
-                count += 1
-            smoothed[k] = total / count
-
-        return smoothed
-
-    # =====================================================================
-    # VFH Adım 3: Binary Histogram
-    # =====================================================================
-
-    def _build_binary_histogram(self, histogram):
-        """
-        Düzleştirilmiş histogramı binary (0/1) histograma dönüştürür.
-
-        Kural:
-            histogram[k] > vfh_threshold → 1 (BLOCKED)
-            histogram[k] ≤ vfh_threshold → 0 (FREE)
-
-        Args:
-            histogram: Düzleştirilmiş polar histogram.
-
-        Returns:
-            Binary histogram (list of int, 0 veya 1).
-        """
-        return [
-            1 if h > self._vfh_threshold else 0
-            for h in histogram
-        ]
-
-    # =====================================================================
-    # VFH Adım 4: Valley Tespiti
-    # =====================================================================
-
-    def _find_valleys(self, binary):
-        """
-        Binary histogramda ardışık FREE (0) sektör gruplarını bulur.
-
-        Dairesel histogram olduğu için wrap-around dikkate alınır.
-        Tüm sektörler FREE ise tek bir 360° valley döner.
-        Tüm sektörler BLOCKED ise boş liste döner.
-
-        Args:
-            binary: Binary histogram (list of int, 0 veya 1).
-
-        Returns:
-            Valley listesi. Her valley: (start_sector, end_sector, width_sectors).
-            start ve end dahildir; genişlik sektör sayısı cinsindendir.
-        """
-        n = len(binary)
-
-        # Tüm sektörler FREE mi?
-        if all(b == 0 for b in binary):
-            return [(0, n - 1, n)]
-
-        # Tüm sektörler BLOCKED mı?
-        if all(b == 1 for b in binary):
-            return []
-
-        # Wrap-around: ilk BLOCKED sektörü bul (başlangıç noktası olarak)
+    def _find_valleys(self, histogram):
         valleys = []
         in_valley = False
-        start = -1
+        start_sector = 0
 
-        first_blocked = -1
-        for i in range(n):
-            if binary[i] == 1:
-                first_blocked = i
-                break
-
-        # Dairesel tarama: first_blocked'dan başla
-        for offset in range(n):
-            i = (first_blocked + offset) % n
-
-            if binary[i] == 0:
+        for i in range(self._sector_count):
+            if histogram[i] < self._vfh_threshold:
                 if not in_valley:
-                    start = i
                     in_valley = True
+                    start_sector = i
             else:
                 if in_valley:
-                    end = (i - 1 + n) % n
-                    # Genişlik hesabı (dairesel)
-                    if end >= start:
-                        width = end - start + 1
-                    else:
-                        width = (n - start) + end + 1
-                    valleys.append((start, end, width))
                     in_valley = False
+                    valleys.append((start_sector, i - 1))
 
-        # Tarama sonunda hâlâ valley içindeysek kapat
         if in_valley:
-            end = (first_blocked - 1 + n) % n
-            if end >= start:
-                width = end - start + 1
-            else:
-                width = (n - start) + end + 1
-            valleys.append((start, end, width))
+            valleys.append((start_sector, self._sector_count - 1))
+
+        # Dairesel sarma kontrolü (360° etrafında)
+        if len(valleys) > 1:
+            first_start, first_end = valleys[0]
+            last_start, last_end = valleys[-1]
+            if last_end == self._sector_count - 1 and first_start == 0:
+                merged_valley = (last_start, first_end)
+                valleys = valleys[1:-1]
+                valleys.append(merged_valley)
 
         return valleys
 
-    # =====================================================================
-    # VFH Adım 5: Valley Genişlik Filtreleme
-    # =====================================================================
+    def _filter_narrow_valleys(self, valleys, min_dist_per_sector):
+        valid_valleys = []
+        required_width = self._vehicle_width + 2.0 * self._safety_margin
 
-    def _filter_valleys_by_width(self, valleys, min_dist_per_sector):
-        """
-        Valley'leri araç genişliğine göre filtreler.
-
-        Bir valley'den geçebilmek için yeterli fiziksel açıklık gerekir.
-        Gerekli minimum açısal genişlik, o yöndeki en yakın engel
-        mesafesine göre hesaplanır:
-            min_angle = 2 × arctan(total_clearance / (2 × obstacle_dist))
-
-        Args:
-            valleys:           Valley listesi [(start, end, width), ...].
-            min_dist_per_sector: Her sektördeki en yakın engel mesafesi.
-
-        Returns:
-            Filtrelenmiş valley listesi.
-        """
-        valid = []
-
-        for (start, end, width) in valleys:
-            # Valley'deki en yakın engel mesafesini bul
-            nearest_dist = self._active_radius
-            idx = start
-            for _ in range(width):
-                if min_dist_per_sector[idx] < nearest_dist:
-                    nearest_dist = min_dist_per_sector[idx]
-                idx = (idx + 1) % self._sector_count
-
-            # Gerekli minimum açısal genişlik (derece)
-            if nearest_dist > 0.1:
-                min_angle_deg = 2.0 * math.degrees(
-                    math.atan2(self._total_clearance / 2.0, nearest_dist)
-                )
+        for v_start, v_end in valleys:
+            if v_start <= v_end:
+                sector_span = v_end - v_start + 1
             else:
-                # Çok yakın engel — çok geniş açıklık gerekir
-                min_angle_deg = 180.0
+                sector_span = (self._sector_count - v_start) + v_end + 1
 
-            # Valley'nin açısal genişliği
-            valley_angle_deg = width * self._sector_width
+            valley_min_dist = self._active_radius
+            curr = v_start
+            for _ in range(sector_span):
+                if min_dist_per_sector[curr] < valley_min_dist:
+                    valley_min_dist = min_dist_per_sector[curr]
+                curr = (curr + 1) % self._sector_count
 
-            if valley_angle_deg >= min_angle_deg:
-                valid.append((start, end, width))
-
-        return valid
-
-    # =====================================================================
-    # VFH Adım 6: En İyi Yön Seçimi
-    # =====================================================================
-
-    def _select_best_direction(self, valleys, goal_sector):
-        """
-        Geçerli valley'ler arasından en iyi yönü maliyet fonksiyonuyla seçer.
-
-        Her valley için aday yönler oluşturulur:
-        - Geniş valley (>= 2× min genişlik): Hedef yönüne en yakın kenar
-        - Dar valley: Merkez
-
-        Maliyet fonksiyonu:
-            cost = μ₁ × |Δhedef| + μ₂ × |Δmevcut| + μ₃ × |Δönceki|
-        burada:
-            Δhedef   = Aday ile hedef sektör arasındaki açısal fark
-            Δmevcut  = Aday ile ileri yön (sektör 0) arasındaki fark
-            Δönceki  = Aday ile önceki seçilen sektör arasındaki fark
-
-        En düşük maliyetli aday seçilir.
-
-        Args:
-            valleys:     Filtrelenmiş valley listesi.
-            goal_sector: Hedef yönüne karşılık gelen sektör.
-
-        Returns:
-            Seçilen sektör indeksi (int).
-        """
-        best_cost   = float('inf')
-        best_sector = 0
-
-        # İleri yön sektörü (body frame 0°)
-        forward_sector = self._angle_to_sector(0.0)
-
-        for (start, end, width) in valleys:
-            # Aday yönleri belirle
-            candidates = self._get_valley_candidates(
-                start, end, width, goal_sector,
+            chord_width = 2.0 * valley_min_dist * math.sin(
+                math.radians(sector_span * self._sector_width / 2.0)
             )
 
-            for candidate in candidates:
-                # Maliyet hesabı
-                d_goal    = self._sector_distance(candidate, goal_sector)
-                d_current = self._sector_distance(candidate, forward_sector)
-                d_prev    = self._sector_distance(candidate, self._previous_selected_sector)
+            if chord_width >= required_width:
+                valid_valleys.append((v_start, v_end))
 
-                cost = (
-                    self._mu_goal     * d_goal
-                    + self._mu_current  * d_current
-                    + self._mu_previous * d_prev
+        return valid_valleys
+
+    def _select_best_sector(self, valid_valleys, goal_sector, min_dist_per_sector):
+        candidate_sectors = []
+
+        for v_start, v_end in valid_valleys:
+            if v_start <= v_end:
+                sector_span = v_end - v_start + 1
+                valley_sectors = list(range(v_start, v_end + 1))
+            else:
+                sector_span = (self._sector_count - v_start) + v_end + 1
+                valley_sectors = (
+                    list(range(v_start, self._sector_count)) + list(range(0, v_end + 1))
                 )
 
-                if cost < best_cost:
-                    best_cost   = cost
-                    best_sector = candidate
+            # Koridor Merkez Sektörü (Clearance Maximization)
+            mid_idx = len(valley_sectors) // 2
+            candidate_sectors.append(valley_sectors[mid_idx])
+
+            if goal_sector in valley_sectors:
+                candidate_sectors.append(goal_sector)
+            else:
+                candidate_sectors.append(valley_sectors[0])
+                candidate_sectors.append(valley_sectors[-1])
+
+        # En İyi Sektörü Cost Fonksiyonu ile Seç
+        best_sector = candidate_sectors[0]
+        best_cost = float('inf')
+
+        for sector in candidate_sectors:
+            cost_goal = self._sector_distance(sector, goal_sector)
+            cost_current = self._sector_distance(sector, 0)
+            cost_previous = self._sector_distance(sector, self._prev_selected_sector)
+
+            # Clearance Maliyeti (Engellere uzak olan sektör daha ucuz)
+            clearance_dist = min_dist_per_sector[sector]
+            cost_clearance = max(0.0, self._active_radius - clearance_dist)
+
+            total_cost = (
+                self._weight_goal * cost_goal +
+                self._weight_current * cost_current +
+                self._weight_previous * cost_previous +
+                self._weight_clearance * cost_clearance
+            )
+
+            if total_cost < best_cost:
+                best_cost = total_cost
+                best_sector = sector
 
         return best_sector
 
-    def _get_valley_candidates(self, start, end, width, goal_sector):
-        """
-        Bir valley için aday yön sektörlerini üretir.
-
-        Geniş valley'ler:
-            - Valley merkezi
-            - Hedef yönüne en yakın kenar (start veya end)
-            - Hedef yönü valley içindeyse direkt hedef yönü
-
-        Dar valley'ler:
-            - Sadece valley merkezi
-
-        Args:
-            start:       Valley başlangıç sektörü.
-            end:         Valley bitiş sektörü.
-            width:       Valley genişliği (sektör sayısı).
-            goal_sector: Hedef sektörü.
-
-        Returns:
-            Aday sektör listesi.
-        """
-        candidates = []
-
-        # Valley merkezi
-        center = (start + width // 2) % self._sector_count
-        candidates.append(center)
-
-        # Geniş valley ise kenar ve hedef adayları ekle
-        min_wide = max(4, int(30.0 / self._sector_width))  # ~30° veya 4 sektör
-
-        if width >= min_wide:
-            # Kenar sektörleri (biraz içerden)
-            margin_sectors = max(1, int(width * 0.15))
-            left_candidate  = (start + margin_sectors) % self._sector_count
-            right_candidate = (end - margin_sectors + self._sector_count) % self._sector_count
-            candidates.append(left_candidate)
-            candidates.append(right_candidate)
-
-            # Hedef sektörü valley içinde mi?
-            if self._is_sector_in_valley(goal_sector, start, width):
-                candidates.append(goal_sector)
-
-        return candidates
-
-    def _is_sector_in_valley(self, sector, valley_start, valley_width):
-        """
-        Bir sektörün valley içinde olup olmadığını kontrol eder.
-        Dairesel (wrap-around) yapıyı dikkate alır.
-        """
-        for i in range(valley_width):
-            if (valley_start + i) % self._sector_count == sector:
-                return True
-        return False
-
-    # =====================================================================
-    # VFH Adım 7: Hız Komutu Hesaplama
-    # =====================================================================
-
-    def _compute_cmd_vel(self, selected_angle_deg, nearest_obstacle_dist):
-        """
-        Seçilen VFH yönüne göre linear.x ve angular.z hesaplar.
-
-        Angular hız:
-            Seçilen yön ile ileri yön (0°) arasındaki açı farkına
-            oransal (P kontrol). Body frame CCW pozitif olduğundan:
-            - selected_angle_deg > 0 → sola dön → angular.z > 0
-            - selected_angle_deg < 0 → sağa dön → angular.z < 0
-
-        Linear hız:
-            Engel yakınlığına göre yavaşlama:
-            - Engel uzakta → max_linear_speed
-            - Engel yakında → min_linear_speed
-            - Keskin dönüşte hız düşürme
-
-        Args:
-            selected_angle_deg:    Seçilen yön (body frame, °).
-            nearest_obstacle_dist: Seçilen yöndeki en yakın engel (m).
-
-        Returns:
-            (linear_speed, angular_speed) tuple'ı.
-        """
-        # ── Açı farkı: seçilen yön vs ileri ──────────────────────────────
+    def _calculate_speeds(self, selected_angle_deg, nearest_obstacle_dist):
         angle_error_deg = self._normalize_angle_180(selected_angle_deg)
         angle_error_rad = math.radians(angle_error_deg)
 
-        # ── Angular hız (P kontrol) ──────────────────────────────────────
         angular_speed = self._steering_kp * angle_error_rad
         angular_speed = self._clamp(angular_speed, -self._max_angular, self._max_angular)
 
-        # ── Linear hız ───────────────────────────────────────────────────
-        # Engel yakınlık faktörü
         if nearest_obstacle_dist <= 0.01:
             dist_factor = 0.0
         elif nearest_obstacle_dist >= self._slowdown_dist:
@@ -822,7 +397,6 @@ class ObstacleAvoidanceNode(Node):
         else:
             dist_factor = nearest_obstacle_dist / self._slowdown_dist
 
-        # Dönüş açısı faktörü: keskin dönüşlerde yavaşla
         abs_error = abs(angle_error_deg)
         if abs_error <= 15.0:
             turn_factor = 1.0
@@ -831,64 +405,146 @@ class ObstacleAvoidanceNode(Node):
         else:
             turn_factor = 1.0 - 0.7 * ((abs_error - 15.0) / 75.0)
 
-        # Toplam hız
         combined_factor = min(dist_factor, turn_factor)
-        linear_speed = (
-            self._min_linear
-            + (self._max_linear - self._min_linear) * combined_factor
-        )
+        linear_speed = self._min_linear + (self._max_linear - self._min_linear) * combined_factor
 
         return linear_speed, angular_speed
 
     def _find_nearest_obstacle_in_cone(self, selected_sector, min_dist_per_sector):
-        """
-        Seçilen sektör ve komşularındaki en yakın engel mesafesini bulur.
-
-        ±2 sektör (±10°) genişliğindeki konide arar.
-
-        Args:
-            selected_sector:     Seçilen sektör indeksi.
-            min_dist_per_sector: Her sektördeki en yakın engel mesafesi.
-
-        Returns:
-            En yakın engel mesafesi (m).
-        """
         nearest = self._active_radius
         cone_half = 2  # ±2 sektör (±10°)
-
         for offset in range(-cone_half, cone_half + 1):
             idx = (selected_sector + offset) % self._sector_count
             if min_dist_per_sector[idx] < nearest:
                 nearest = min_dist_per_sector[idx]
-
         return nearest
 
-    # =====================================================================
-    # Veri Geçerlilik ve Güvenlik Kontrolü
-    # =====================================================================
+    # =========================================================================
+    # Yayın Yardımcıları & Görselleştirme
+    # =========================================================================
+
+    def _publish_path(self, selected_angle_deg: float, linear_speed: float):
+        path = Path()
+        path.header.stamp = self.get_clock().now().to_msg()
+        path.header.frame_id = 'base_link'
+
+        # 4 metrelik güvenli rotayı 8 adımla çiz
+        angle_rad = math.radians(selected_angle_deg)
+        num_points = 8
+        step_len = 0.50  # 4m toplam
+
+        for i in range(num_points + 1):
+            d = i * step_len
+            ps = PoseStamped()
+            ps.header.stamp = path.header.stamp
+            ps.header.frame_id = 'base_link'
+            ps.pose.position.x = d * math.cos(angle_rad)
+            ps.pose.position.y = d * math.sin(angle_rad)
+            ps.pose.position.z = 0.05
+            ps.pose.orientation.w = 1.0
+            path.poses.append(ps)
+
+        self._pub_path.publish(path)
+
+    def _publish_avoidance_markers(self, selected_angle_deg: float, goal_angle_deg: float, nearest_obs_dist: float):
+        ma = MarkerArray()
+        now_stamp = self.get_clock().now().to_msg()
+
+        # 1) Seçilen Yön Ok Marker'ı (Yeşil ARROW)
+        sm = Marker()
+        sm.header.stamp = now_stamp
+        sm.header.frame_id = 'base_link'
+        sm.ns = 'vfh_selected_direction'
+        sm.id = 100
+        sm.type = Marker.ARROW
+        sm.action = Marker.ADD
+        sm.scale.x = 2.5  # Ok boyu
+        sm.scale.y = 0.25
+        sm.scale.z = 0.25
+        sm.color.r, sm.color.g, sm.color.b, sm.color.a = (0.0, 1.0, 0.2, 0.95)
+
+        s_rad = math.radians(selected_angle_deg)
+        cy = math.cos(s_rad * 0.5)
+        sy = math.sin(s_rad * 0.5)
+        sm.pose.orientation.z = sy
+        sm.pose.orientation.w = cy
+        ma.markers.append(sm)
+
+        # 2) Hedef Yön Ok Marker'ı (Mavi ARROW)
+        gm = Marker()
+        gm.header.stamp = now_stamp
+        gm.header.frame_id = 'base_link'
+        gm.ns = 'vfh_goal_direction'
+        gm.id = 101
+        gm.type = Marker.ARROW
+        gm.action = Marker.ADD
+        gm.scale.x = 2.0
+        gm.scale.y = 0.15
+        gm.scale.z = 0.15
+        gm.color.r, gm.color.g, gm.color.b, gm.color.a = (0.2, 0.5, 1.0, 0.70)
+
+        g_rad = math.radians(goal_angle_deg)
+        gm.pose.orientation.z = math.sin(g_rad * 0.5)
+        gm.pose.orientation.w = math.cos(g_rad * 0.5)
+        ma.markers.append(gm)
+
+        # 3) En Yakın Engel Küresi Marker'ı (Kırmızı SPHERE)
+        if nearest_obs_dist < self._active_radius:
+            om = Marker()
+            om.header.stamp = now_stamp
+            om.header.frame_id = 'base_link'
+            om.ns = 'vfh_nearest_obstacle'
+            om.id = 102
+            om.type = Marker.SPHERE
+            om.action = Marker.ADD
+            om.pose.position.x = nearest_obs_dist * math.cos(s_rad)
+            om.pose.position.y = nearest_obs_dist * math.sin(s_rad)
+            om.pose.position.z = 0.10
+            om.scale.x = 0.4
+            om.scale.y = 0.4
+            om.scale.z = 0.4
+            om.color.r, om.color.g, om.color.b, om.color.a = (1.0, 0.0, 0.0, 0.90)
+            ma.markers.append(om)
+
+        self._pub_markers.publish(ma)
+
+    def _publish_stop(self):
+        cmd = Twist()
+        self._pub_cmd_vel.publish(cmd)
+
+    def _publish_status(self, active, reason, selected_angle_deg, linear_speed, angular_speed, **kwargs):
+        now = time.time()
+        if now - self._last_status_pub_time < 0.5:
+            return
+        self._last_status_pub_time = now
+
+        status = {
+            'active': active,
+            'reason': reason,
+            'selected_angle_deg': round(selected_angle_deg, 1),
+            'linear_speed': round(linear_speed, 3),
+            'angular_speed': round(angular_speed, 3),
+            'total_commands': self._total_commands_sent,
+            'total_stops': self._total_stops,
+        }
+
+        if self._latest_state is not None:
+            st = self._latest_state
+            status['heading_error_deg'] = round(st.heading_error_deg, 1)
+            status['turn_direction'] = st.turn_direction
+            status['current_yaw_deg'] = round(st.current_yaw_deg, 1)
+
+        msg = String()
+        msg.data = json.dumps(status, ensure_ascii=False)
+        self._pub_status.publish(msg)
+
+    # =========================================================================
+    # Kontroller ve Yardımcılar
+    # =========================================================================
 
     def _check_data_validity(self):
-        """
-        Tüm girdi verilerinin tazeliğini ve güvenliğini kontrol eder.
-        State node'dan gelen VehicleState mesajındaki güvenlik alanları
-        da burada değerlendirilir.
-
-        Kontrol sırası:
-        1. State verisi alınmış ve taze mi?
-        2. Costmap verisi alınmış ve taze mi?
-        3. Costmap geçerli mi?
-        4. State: mission_active == True mi?
-        5. State: target_valid == True mi?
-        6. State: imu_valid == True mi?
-        7. State: emergency_stop == False mi?
-        8. State: control_allowed == True mi?
-
-        Returns:
-            (ok: bool, reason: str) tuple'ı.
-        """
         now = self.get_clock().now()
 
-        # 1. State kontrolü
         if self._latest_state is None:
             return False, 'STATE_NOT_RECEIVED'
 
@@ -899,7 +555,6 @@ class ObstacleAvoidanceNode(Node):
 
         state = self._latest_state
 
-        # 2. Costmap kontrolü
         if self._latest_costmap is None:
             return False, 'COSTMAP_NOT_RECEIVED'
 
@@ -908,150 +563,59 @@ class ObstacleAvoidanceNode(Node):
             if costmap_age > self._costmap_timeout:
                 return False, f'COSTMAP_STALE ({costmap_age:.1f}s)'
 
-        # 3. Costmap geçerlilik
         if not self._costmap_valid:
             return False, 'COSTMAP_INVALID'
 
-        # 4. Görev aktif mi?
         if not state.mission_active:
             return False, 'MISSION_NOT_ACTIVE'
 
-        # 5. Hedef geçerli mi?
         if not state.target_valid:
             return False, 'TARGET_INVALID'
 
-        # 6. IMU geçerli mi?
-        if not state.imu_valid:
-            return False, 'IMU_INVALID'
-
-        # 7. Acil durdurma aktif mi?
         if state.emergency_stop:
             return False, 'EMERGENCY_STOP_ACTIVE'
 
-        # 8. Kontrol izni var mı?
         if not state.control_allowed:
             return False, 'CONTROL_NOT_ALLOWED'
 
         return True, 'OK'
 
-    # =====================================================================
-    # Yayın Yardımcıları
-    # =====================================================================
-
-    def _publish_stop(self):
-        """Sıfır hız komutu yayınlar (araç dursun)."""
-        cmd = Twist()
-        self._pub_cmd_vel.publish(cmd)
-
-    def _publish_status(self, active, reason, selected_angle_deg,
-                        linear_speed, angular_speed, **kwargs):
-        """
-        Debug/YKİ için JSON formatında durum bilgisi yayınlar.
-
-        Yayın sıklığı: saniyede en fazla 2 kez (throttled).
-        """
-        now = time.time()
-        if now - self._last_status_time < 0.5:
-            return
-        self._last_status_time = now
-
-        status = {
-            'active':              active,
-            'reason':              reason,
-            'selected_angle_deg':  round(selected_angle_deg, 1),
-            'linear_speed':        round(linear_speed, 3),
-            'angular_speed':       round(angular_speed, 3),
-            'total_commands':      self._total_commands_sent,
-            'total_stops':         self._total_stops,
-        }
-
-        # State verisi varsa ekle
-        if self._latest_state is not None:
-            state = self._latest_state
-            status['heading_error_deg'] = round(state.heading_error_deg, 1)
-            status['turn_direction']    = state.turn_direction
-            status['current_yaw_deg']   = round(state.current_yaw_deg, 1)
-            status['distance_to_target'] = round(state.distance_to_target_m, 2)
-            status['current_parkur']    = state.current_parkur
-
-        # Ek bilgiler
-        if 'goal_sector' in kwargs:
-            status['goal_sector'] = kwargs['goal_sector']
-        if 'selected_sector' in kwargs:
-            status['selected_sector'] = kwargs['selected_sector']
-        if 'nearest_obstacle' in kwargs:
-            status['nearest_obstacle_m'] = round(kwargs['nearest_obstacle'], 2)
-        if 'valleys' in kwargs:
-            status['valley_count'] = len(kwargs['valleys'])
-        if 'valid_valleys' in kwargs:
-            status['valid_valley_count'] = len(kwargs['valid_valleys'])
-
-        msg = String()
-        msg.data = json.dumps(status, ensure_ascii=False)
-        self._pub_status.publish(msg)
-
-    # =====================================================================
-    # Yardımcı Fonksiyonlar
-    # =====================================================================
-
     def _angle_to_sector(self, angle_deg):
-        """
-        Açıyı (derece) sektör indeksine dönüştürür.
-        Açı [0°, 360°) aralığına normalize edilir ve sektör genişliğine bölünür.
-        """
         normalized = angle_deg % 360.0
-        sector = int(normalized / self._sector_width) % self._sector_count
-        return sector
+        return int(normalized / self._sector_width) % self._sector_count
 
     def _sector_to_angle(self, sector):
-        """
-        Sektör indeksini merkez açısına dönüştürür.
-        Açı [-180°, +180°) aralığında döndürülür (body frame).
-        """
         angle = (sector + 0.5) * self._sector_width
         return self._normalize_angle_180(angle)
 
     def _sector_distance(self, sector_a, sector_b):
-        """
-        İki sektör arasındaki en kısa dairesel mesafeyi hesaplar.
-        """
         diff = abs(sector_a - sector_b)
         return min(diff, self._sector_count - diff)
 
     @staticmethod
     def _normalize_angle_180(angle_deg):
-        """Açıyı [-180°, +180°) aralığına normalize eder."""
         return (angle_deg + 180.0) % 360.0 - 180.0
 
     @staticmethod
-    def _clamp(value, min_val, max_val):
-        """Değeri [min_val, max_val] aralığına sınırlar."""
-        return max(min_val, min(max_val, value))
+    def _clamp(val, min_v, max_v):
+        return max(min_v, min(max_v, val))
 
 
-# =============================================================================
+# ---------------------------------------------------------------------------
 # Entry Point
-# =============================================================================
-
+# ---------------------------------------------------------------------------
 def main(args=None):
     rclpy.init(args=args)
     node = ObstacleAvoidanceNode()
-
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info(
-            f'VFH Karar Node durduruldu. '
-            f'Toplam komut: {node._total_commands_sent} | '
-            f'Toplam durma: {node._total_stops}'
-        )
+        node.get_logger().info('VFH Karar Node durduruldu.')
     finally:
-        # Son olarak sıfır hız gönder
         try:
             node._publish_stop()
         except Exception:
             pass
-
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
