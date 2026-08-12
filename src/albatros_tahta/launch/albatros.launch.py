@@ -11,17 +11,13 @@ Kullanım:
 
 Katmanlı başlatma sırası:
     1. Sensör Katmanı      : gps_node, imu_node, mesafe_sensor_node, kamera_node
-    2. Algılama Katmanı    : yolo_node, duba_fusion_node, costmap_node
+    2. Algılama Katmanı    : yolo_node, parkur3_target_node, duba_fusion_node, costmap_node
     3. Durum & Görev       : state_node, mission_node
     4. Karar & Kontrol     : karar_node, kontrol_node
-
-Not: MAVROS ayrı bir terminalde veya ayrı bir launch dosyasıyla başlatılmalıdır.
-     ros2 run mavros mavros_node --ros-args -p fcu_url:=/dev/ttyACM0:57600
-
-Yazar  : LODOS Takımı
-Araç   : Albatros İDA
-Ortam  : Ubuntu 24.04 / ROS2 Jazzy
 """
+
+import os
+from ament_index_python.packages import get_package_share_directory
 
 from launch import LaunchDescription
 from launch.actions import LogInfo, TimerAction
@@ -32,6 +28,14 @@ def generate_launch_description():
     """Tüm albatros_tahta node'larını oluşturur ve döndürür."""
 
     pkg = 'albatros_tahta'
+
+    try:
+        tahta_share = get_package_share_directory('albatros_tahta')
+        default_parkur12_hef = os.path.join(tahta_share, 'models', 'parkur12.hef')
+        default_parkur3_hef = os.path.join(tahta_share, 'models', 'parkur3.hef')
+    except Exception:
+        default_parkur12_hef = 'models/parkur12.hef'
+        default_parkur3_hef = 'models/parkur3.hef'
 
     # ╔══════════════════════════════════════════════════════════════════╗
     # ║  1. SENSÖR KATMANI                                             ║
@@ -44,7 +48,6 @@ def generate_launch_description():
         name='gps_node',
         output='screen',
         parameters=[{
-            # GPS seri port ayarları — donanıma göre güncelle
             'serial_port': '/dev/ttyUSB0',
             'baud_rate': 9600,
         }],
@@ -55,9 +58,7 @@ def generate_launch_description():
         executable='imu_node',
         name='imu_node',
         output='screen',
-        parameters=[{
-            # IMU/pusula verisi MAVROS üzerinden gelir
-        }],
+        parameters=[{}],
     )
 
     mesafe_sensor_node = Node(
@@ -65,9 +66,7 @@ def generate_launch_description():
         executable='mesafe_sensor_node',
         name='mesafe_sensor_node',
         output='screen',
-        parameters=[{
-            # Ultrasonik mesafe sensörü ayarları
-        }],
+        parameters=[{}],
     )
 
     kamera_node = Node(
@@ -76,14 +75,13 @@ def generate_launch_description():
         name='kamera_node',
         output='screen',
         parameters=[{
-            # Kamera cihaz ID'si
             'camera_id': 0,
         }],
     )
 
     # ╔══════════════════════════════════════════════════════════════════╗
     # ║  2. ALGILAMA KATMANI                                           ║
-    # ║  YOLO duba tespiti, duba birleştirme, costmap oluşturma        ║
+    # ║  YOLO duba tespiti, Parkur 3 Hedef Doğrulama, costmap          ║
     # ╚══════════════════════════════════════════════════════════════════╝
 
     yolo_node = Node(
@@ -92,10 +90,26 @@ def generate_launch_description():
         name='yolo_node',
         output='screen',
         parameters=[{
-            'model_path': 'models/yolov11s.hef',
-            'confidence_threshold': 0.50,
+            'parkur12_model_path': default_parkur12_hef,
+            'parkur3_model_path': default_parkur3_hef,
+            'confidence_threshold': 0.30,
             'model_input_width': 640,
             'model_input_height': 640,
+        }],
+    )
+
+    parkur3_target_node = Node(
+        package=pkg,
+        executable='parkur3_target_node',
+        name='parkur3_target_node',
+        output='screen',
+        parameters=[{
+            'yolo_weight': 0.40,
+            'opencv_weight': 0.60,
+            'final_score_threshold': 0.65,
+            'yolo_min_confidence': 0.30,
+            'validation_window_size': 5,
+            'required_confirmations': 4,
         }],
     )
 
@@ -104,9 +118,7 @@ def generate_launch_description():
         executable='duba_fusion_node',
         name='duba_fusion_node',
         output='screen',
-        parameters=[{
-            # Duba birleştirme ve hedef kilitleme parametreleri
-        }],
+        parameters=[{}],
     )
 
     costmap_node = Node(
@@ -115,7 +127,22 @@ def generate_launch_description():
         name='costmap_node',
         output='screen',
         parameters=[{
-            # Costmap engel haritası parametreleri
+            'local_resolution': 0.20,
+            'local_width_cells': 80,
+            'local_height_cells': 80,
+            'vehicle_forward_ratio': 0.20,
+            'inflation_radius': 1.5,
+            'decay_time_tentative': 4.0,
+            'decay_time_confirmed': 20.0,
+            'publish_rate': 5.0,
+            'obstacle_timeout': 1.5,
+            'association_distance_m': 0.60,
+            'confirm_detection_threshold': 2,
+            'max_gps_jump_m': 10.0,
+            'max_boundary_link_distance_m': 4.50,
+            'global_resolution': 0.25,
+            'global_width_m': 60.0,
+            'global_height_m': 60.0,
         }],
     )
 
@@ -166,13 +193,14 @@ def generate_launch_description():
             'required_reached_samples': 3,
             'mission_pull_retry_period_sec': 5.0,
             'publish_period_sec': 0.2,
-            # ─── Parkur waypoint sınırları ───
-            # Yarışma günü verilen waypoint sayısına göre güncelle!
-            # Örnek: WP1-WP3 → Parkur1, WP4-WP6 → Parkur2, WP7+ → Parkur3
             'parkur_1_start_wp': 1,
             'parkur_2_start_wp': 4,
             'parkur_3_start_wp': 7,
             'auto_pull_mission_on_startup': True,
+            'scan_settle_time_sec': 0.5,
+            'yaw_tolerance_deg': 3.0,
+            'target_lost_timeout_sec': 2.0,
+            'touch_distance_threshold_m': 1.5,
         }],
     )
 
@@ -187,21 +215,25 @@ def generate_launch_description():
         name='karar_node',
         output='screen',
         parameters=[{
-            # VFH algoritma parametreleri
             'sector_count': 72,
-            'vfh_threshold': 0.3,
+            'vfh_threshold': 0.35,
             'active_region_radius': 6.0,
             'vehicle_width': 0.85,
-            'safety_margin': 0.5,
+            'safety_margin': 0.50,
             'max_linear_speed': 1.0,
             'min_linear_speed': 0.2,
             'max_angular_speed': 0.8,
             'cost_goal_weight': 5.0,
             'cost_current_weight': 2.0,
             'cost_previous_weight': 2.0,
+            'cost_clearance_weight': 3.0,
             'slowdown_distance': 2.0,
+            'emergency_stop_distance_m': 1.0,
+            'unknown_is_blocked': False,
             'publish_rate': 10.0,
             'steering_kp': 1.5,
+            'costmap_timeout_sec': 1.5,
+            'state_timeout_sec': 2.0,
         }],
     )
 
@@ -221,51 +253,42 @@ def generate_launch_description():
         }],
     )
 
-    # ╔══════════════════════════════════════════════════════════════════╗
-    # ║  LAUNCH AKIŞI                                                  ║
-    # ║  Sensörler → Algılama → Durum/Görev → Karar/Kontrol            ║
-    # ╚══════════════════════════════════════════════════════════════════╝
-
     return LaunchDescription([
 
-        # ── Başlangıç bildirimi ──
         LogInfo(msg='═══════════════════════════════════════════════════'),
         LogInfo(msg='  LODOS Albatros İDA — Sistem Başlatılıyor...     '),
         LogInfo(msg='═══════════════════════════════════════════════════'),
 
-        # ── Katman 1: Sensörler (hemen başlat) ──
         gps_node,
         imu_node,
         mesafe_sensor_node,
         kamera_node,
 
-        # ── Katman 2: Algılama (1 sn gecikme — sensörlerin hazır olmasını bekle) ──
         TimerAction(
             period=1.0,
             actions=[
-                LogInfo(msg='[LAUNCH] Algılama katmanı başlatılıyor...'),
+                LogInfo(msg='[LAUNCH] Algılama katmanı (YOLO & Parkur3 perception) başlatılıyor...'),
                 yolo_node,
+                parkur3_target_node,
                 duba_fusion_node,
                 costmap_node,
             ],
         ),
 
-        # ── Katman 3: Durum & Görev (2 sn gecikme) ──
         TimerAction(
             period=2.0,
             actions=[
-                LogInfo(msg='[LAUNCH] Durum, görev ve hedef renk katmanı başlatılıyor...'),
+                LogInfo(msg='[LAUNCH] Durum ve görev katmanı başlatılıyor...'),
                 state_node,
                 mission_node,
                 target_color_node,
             ],
         ),
 
-        # ── Katman 4: Karar & Kontrol (3 sn gecikme — tüm veri akışı hazır) ──
         TimerAction(
             period=3.0,
             actions=[
-                LogInfo(msg='[LAUNCH] Karar ve kontrol katmanı başlatılıyor...'),
+                LogInfo(msg='[LAUNCH] Karar ve kontrol katmanı (VFH Avoidance & Motor Command) başlatılıyor...'),
                 karar_node,
                 kontrol_node,
                 LogInfo(msg='═══════════════════════════════════════════════════'),

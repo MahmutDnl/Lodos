@@ -16,6 +16,9 @@ setup(
         # Launch dosyalarını share dizinine kopyala
         (os.path.join('share', package_name, 'launch'),
             glob(os.path.join('launch', '*.launch.py'))),
+        # HEF model dosyalarını share/models dizinine kopyala
+        (os.path.join('share', package_name, 'models'),
+            glob(os.path.join('models', '*.hef'))),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -41,7 +44,6 @@ setup(
         'mission_node = albatros_tahta.mission_node:main',
         'state_node = albatros_tahta.state_node:main',
         'karar_node = albatros_tahta.karar_node:main',
-        'target_color_node = albatros_tahta.target_color_node:main',
     ],
     }
 )
