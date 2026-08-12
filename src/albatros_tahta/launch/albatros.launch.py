@@ -120,6 +120,23 @@ def generate_launch_description():
     )
 
     # ╔══════════════════════════════════════════════════════════════════╗
+    # ║  2.5 PARKUR 3 — HEDEF RENK DİNLEYİCİ                          ║
+    # ║  İHA/YKİ'den MAVROS üzerinden gelen hedef renk bilgisi         ║
+    # ╚══════════════════════════════════════════════════════════════════╝
+
+    target_color_node = Node(
+        package=pkg,
+        executable='target_color_node',
+        name='target_color_node',
+        output='screen',
+        parameters=[{
+            'publish_rate': 2.0,
+            'status_rate': 1.0,
+            'color_timeout_sec': 30.0,
+        }],
+    )
+
+    # ╔══════════════════════════════════════════════════════════════════╗
     # ║  3. DURUM ve GÖREV YÖNETİMİ                                   ║
     # ║  Araç durumu birleştirme, görev/waypoint yönetimi              ║
     # ╚══════════════════════════════════════════════════════════════════╝
@@ -237,9 +254,10 @@ def generate_launch_description():
         TimerAction(
             period=2.0,
             actions=[
-                LogInfo(msg='[LAUNCH] Durum ve görev katmanı başlatılıyor...'),
+                LogInfo(msg='[LAUNCH] Durum, görev ve hedef renk katmanı başlatılıyor...'),
                 state_node,
                 mission_node,
+                target_color_node,
             ],
         ),
 

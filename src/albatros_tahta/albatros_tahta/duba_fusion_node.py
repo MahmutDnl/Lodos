@@ -100,8 +100,20 @@ CLASS_NAME_TO_TYPE: dict[str, str] = {
     'yesil_duba':         'target_buoy',
     'green_buoy':         'target_buoy',
     'yesil':              'target_buoy',
+    'siyah_duba':         'target_buoy',
+    'black_buoy':         'target_buoy',
+    'siyah':              'target_buoy',
     'hedef_duba':         'goal_buoy',
     'goal_buoy':          'goal_buoy',
+}
+
+# Hedef renk adı → YOLO class_name eşleştirmesi
+# target_color_node'dan gelen renk adı ile YOLO sinif adi eslestirilir.
+# Ornegin İHA 'kirmizi' gonderirse, 'kirmizi_duba' sinifindaki duba goal_buoy olur.
+TARGET_COLOR_TO_CLASS_PREFIXES: dict[str, list[str]] = {
+    'kirmizi': ['kirmizi_duba', 'kirmizi', 'red_buoy'],
+    'yesil':   ['yesil_duba',   'yesil',   'green_buoy'],
+    'siyah':   ['siyah_duba',   'siyah',   'black_buoy'],
 }
 
 # Varsayilan duba fiziksel yaricapi (metre)
@@ -201,6 +213,8 @@ class DubaFusionNode(Node):
 
         self.declare_parameter('publish_empty_results', True)
         self.declare_parameter('log_fusion_results',    False)
+        self.declare_parameter('target_color_topic',
+                               '/perception/target_color')
 
         # Parametre degerlerini oku
         self._yolo_topic      = self.get_parameter('yolo_input_topic').value
@@ -213,6 +227,11 @@ class DubaFusionNode(Node):
         self._angle_tol       = self.get_parameter('sensor_angle_tolerance_deg').value
         self._pub_empty       = self.get_parameter('publish_empty_results').value
         self._log_fusion      = self.get_parameter('log_fusion_results').value
+        self._target_color_topic = self.get_parameter('target_color_topic').value
+
+        # ── Parkur-3 hedef renk durumu ────────────────────────────────────────
+        # target_color_node'dan gelen İHA hedef rengi (ornegin: 'kirmizi')
+        self._target_color: str = ''  # Bos ise henuz hedef renk alinmamis
 
         # Sensor merkez acilari sozlugu
         self._sensor_angles: dict[str, float] = {
@@ -258,6 +277,14 @@ class DubaFusionNode(Node):
             )
             self._sensor_subscriptions.append(sub)
 
+        # Parkur-3: Hedef renk subscriber'i
+        self._sub_target_color = self.create_subscription(
+            String,
+            self._target_color_topic,
+            self._cb_target_color,
+            10
+        )
+
         # ── Publisher ─────────────────────────────────────────────────────────
         self._pub = self.create_publisher(String, self._output_topic, 10)
 
@@ -277,7 +304,29 @@ class DubaFusionNode(Node):
             self.get_logger().info(
                 f'  {name:<10}: merkez aci = {angle:+.1f} deg'
             )
+        self.get_logger().info(f'  Hedef renk topic : {self._target_color_topic}')
         self.get_logger().info(sep)
+
+    # =========================================================================
+    # Callback: Parkur-3 hedef renk
+    # =========================================================================
+
+    def _cb_target_color(self, msg: String):
+        """
+        /perception/target_color callback'i.
+        IHA'nin algiladigi hedef renk bilgisini saklar.
+        Gecerli degerler: 'kirmizi', 'yesil', 'siyah'
+        """
+        color = msg.data.strip().lower()
+        if color not in TARGET_COLOR_TO_CLASS_PREFIXES:
+            return
+
+        if color != self._target_color:
+            self.get_logger().info(
+                f'[PARKUR-3] Hedef renk guncellendi: '
+                f'{self._target_color or "yok"} -> {color.upper()}'
+            )
+            self._target_color = color
 
     # =========================================================================
     # Yardimci: sensor callback fabrikasi
@@ -402,18 +451,33 @@ class DubaFusionNode(Node):
 
         # costmap_node'un beklentisiyle uyumlu format:
         # obstacles[] icinde x_m, y_m, type, confidence, id, radius_m
+        #
+        # PARKUR-3 ENTEGRASYONU:
+        # Eger hedef renk bilgisi mevcut ise (self._target_color != ''),
+        # o renkle eslesen dubayi 'target_buoy' yerine 'goal_buoy' olarak
+        # isaretle. Boylece costmap_node bu dubayi engel olarak gormez,
+        # karar_node ise bu dubaya kilitlenir.
         obstacles_for_costmap = []
         for idx, d in enumerate(fused_dets):
-            obs_type = class_name_to_type(d.get('class_name', 'unknown'))
+            class_name = d.get('class_name', 'unknown')
+            obs_type = class_name_to_type(class_name)
+
+            # Parkur-3: Hedef renkle eslesen dubayi goal_buoy yap
+            if (self._target_color
+                    and obs_type == 'target_buoy'
+                    and self._is_target_color_match(class_name)):
+                obs_type = 'goal_buoy'
+
             obstacles_for_costmap.append({
                 'id':            f"fusion_{idx}_{int(stamp * 1000) % 100000}",
                 'type':          obs_type,
-                'class_name':    d.get('class_name', 'unknown'),
+                'class_name':    class_name,
                 'confidence':    d.get('fusion_confidence', 0.0),
                 'x_m':           d.get('x_body_m', 0.0),
                 'y_m':           d.get('y_body_m', 0.0),
                 'radius_m':      DEFAULT_BUOY_RADIUS_M,
                 'range_verified': d.get('fusion_source') == 'yolo_and_distance_sensor',
+                'is_goal':       obs_type == 'goal_buoy',
             })
 
         payload = {
@@ -440,6 +504,19 @@ class DubaFusionNode(Node):
                     f"bearing={d['bearing_deg']:.1f} deg | "
                     f"guven={d['fusion_confidence']:.2f}"
                 )
+
+    def _is_target_color_match(self, class_name: str) -> bool:
+        """
+        Verilen YOLO class_name'in, IHA'nin gonderdigi hedef renkle
+        eslesip eslesmedigini kontrol eder.
+
+        Ornek: self._target_color='kirmizi' ve class_name='kirmizi_duba' → True
+        """
+        if not self._target_color:
+            return False
+        prefixes = TARGET_COLOR_TO_CLASS_PREFIXES.get(self._target_color, [])
+        cn = class_name.lower().strip()
+        return cn in prefixes
 
     # =========================================================================
     # Tek bir detection icin fuzyon
