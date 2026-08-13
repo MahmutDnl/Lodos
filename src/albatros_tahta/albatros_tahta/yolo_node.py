@@ -72,11 +72,12 @@ class YoloNode(Node):
         self.declare_parameter("processed_image_topic", "/albatros/kamera/processed")
         self.declare_parameter("detections_topic", "/albatros/yolo/tespitler")
         self.declare_parameter("obstacles_topic", "/albatros/yolo/obstacles")
-        self.declare_parameter("status_topic", "/albatros/yolo/status")
+        self.declare_parameter("status_topic", "/albatros/yolo/model_status")
 
-        self.declare_parameter("model_path", "models/parkur12.hef")
-        self.declare_parameter("parkur12_model_path", "models/parkur12.hef")
-        self.declare_parameter("parkur3_model_path", "models/parkur3.hef")
+        self.declare_parameter("model_path", "models/parkur_1_2.hef")
+        self.declare_parameter("parkur_1_2_model", "models/parkur_1_2.hef")
+        self.declare_parameter("parkur_3_model", "models/parkur_3.hef")
+        self.declare_parameter("mission_status_timeout_sec", 2.0)
 
         # Global YOLO confidence threshold (0.30 canonical value across all parkours)
         self.declare_parameter("confidence_threshold", 0.30)
@@ -100,9 +101,10 @@ class YoloNode(Node):
         self.obstacles_topic = str(self.get_parameter("obstacles_topic").value)
         self.status_topic = str(self.get_parameter("status_topic").value)
 
-        self.parkur12_model_path_param = str(self.get_parameter("parkur12_model_path").value)
-        self.parkur3_model_path_param = str(self.get_parameter("parkur3_model_path").value)
+        self.parkur12_model_path_param = str(self.get_parameter("parkur_1_2_model").value)
+        self.parkur3_model_path_param = str(self.get_parameter("parkur_3_model").value)
         self.legacy_model_path_param = str(self.get_parameter("model_path").value)
+        self.mission_status_timeout_sec = float(self.get_parameter("mission_status_timeout_sec").value)
 
         # Confidence eşiğini 0.30 kabul et
         conf_val = float(self.get_parameter("yolo_conf_threshold").value)
@@ -215,6 +217,10 @@ class YoloNode(Node):
         # ─── Worker Thread ──────────────────────────────────────────────────
         self.worker_thread = threading.Thread(target=self.inference_worker, daemon=True)
         self.worker_thread.start()
+
+        self.last_mission_status_time = 0.0
+        self.current_parkur = 0  # PARKUR_UNKNOWN
+        self.timeout_timer = self.create_timer(1.0, self._check_mission_timeout)
 
         self._publish_status()
 
@@ -344,8 +350,9 @@ class YoloNode(Node):
                 "Parkur 1/2 modeli ile node çalışmaya devam ediyor. Parkur3 model switching pasif."
             )
 
-        # İlk Başlangıç Modelini Yükle (parkur12)
-        self.load_hef_pipeline(self.parkur12_resolved_path, "parkur12")
+        # İlk Başlangıçta Model Yükleme (Mission bilgisi bekleniyor)
+        self.active_model_name = None
+        self.get_logger().info("[YOLO] Mission bilgisi bekleniyor. Model henüz aktif değil.")
 
         # Startup Özeti Logla
         self._print_startup_banner()
@@ -470,13 +477,30 @@ class YoloNode(Node):
     # Mission Status / Vehicle State Callback'leri
     # =========================================================================
 
-    def _evaluate_model_switch_request(self, current_parkur: int, mission_state_str: str):
-        mission_state_upper = str(mission_state_str).upper()
+    def _check_mission_timeout(self):
+        if self.last_mission_status_time > 0 and (time.time() - self.last_mission_status_time > self.mission_status_timeout_sec):
+            if self.active_model_name is not None:
+                self.get_logger().warn("[YOLO] Mission bilgisi zaman aşımı! Inference güvenli şekilde durduruluyor.")
+                self.current_parkur = 0  # PARKUR_UNKNOWN
+                self._cleanup_hailo_pipeline()
+                self.active_model_name = None
+                self.pending_requested_model = None
+                self._publish_status()
 
-        if current_parkur == 3 or "PARKUR3" in mission_state_upper or "PARKUR_3" in mission_state_upper:
+    def _evaluate_model_switch_request(self, current_parkur: int, mission_state_str: str):
+        self.last_mission_status_time = time.time()
+        self.current_parkur = current_parkur
+
+        p1 = MissionStatus.PARKUR_1 if MissionStatus else 1
+        p2 = MissionStatus.PARKUR_2 if MissionStatus else 2
+        p3 = MissionStatus.PARKUR_3 if MissionStatus else 3
+
+        if current_parkur in [p1, p2]:
+            target_model = "parkur12"
+        elif current_parkur == p3:
             target_model = "parkur3"
         else:
-            target_model = "parkur12"
+            target_model = None
 
         if target_model != self.active_model_name:
             now = time.time()
@@ -484,7 +508,14 @@ class YoloNode(Node):
                 self.pending_requested_model = target_model
                 self.last_model_switch_request_time = now
             elif now - self.last_model_switch_request_time >= self.model_switch_debounce_sec:
-                self.switch_hailo_model(target_model)
+                if target_model is None:
+                    self.get_logger().info(f"[YOLO] Bilinmeyen parkur ({current_parkur}). Inference durduruluyor.")
+                    self._cleanup_hailo_pipeline()
+                    self.active_model_name = None
+                    self.pending_requested_model = None
+                    self._publish_status()
+                else:
+                    self.switch_hailo_model(target_model)
 
     def mission_status_callback(self, msg):
         self._evaluate_model_switch_request(msg.current_parkur, msg.mission_state)
@@ -833,13 +864,18 @@ class YoloNode(Node):
             return
         self._last_status_pub_time = now
 
+        active_model_str = None
+        if self.active_model_name == "parkur12":
+            active_model_str = "parkur_1_2.hef"
+        elif self.active_model_name == "parkur3":
+            active_model_str = "parkur_3.hef"
+
         payload = {
+            "current_parkur": getattr(self, "current_parkur", 0),
+            "active_model": active_model_str,
+            "model_loaded": self.infer_pipeline is not None,
+            "switching": (self.pending_requested_model is not None and self.pending_requested_model != self.active_model_name),
             "ready": HAILO_AVAILABLE and self.infer_pipeline is not None,
-            "hailo_ready": HAILO_AVAILABLE,
-            "active_model": self.active_model_name,
-            "parkur12_available": self.parkur12_available,
-            "parkur3_available": self.parkur3_available,
-            "confidence_threshold": self.confidence_threshold,
             "last_inference_ok": self._last_inference_ok,
         }
 
