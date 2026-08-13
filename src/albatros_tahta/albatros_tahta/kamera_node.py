@@ -12,27 +12,34 @@ class CameraNode(Node):
         super().__init__('camera_node')
 
         self.declare_parameter('camera_index', 0)
+        self.declare_parameter('camera_id', 0)
         self.declare_parameter('frame_width', 640)
         self.declare_parameter('frame_height', 480)
         self.declare_parameter('fps', 30.0)
 
-        self.camera_index = self.get_parameter('camera_index').value
+        cam_idx = self.get_parameter('camera_index').value
+        cam_id = self.get_parameter('camera_id').value
+        self.camera_index = cam_id if cam_id != 0 else cam_idx
         self.frame_width = self.get_parameter('frame_width').value
         self.frame_height = self.get_parameter('frame_height').value
         self.fps = self.get_parameter('fps').value
 
         self.publisher_ = self.create_publisher(Image, '/albatros/kamera/image_raw', 10)
 
-        self.cap = cv2.VideoCapture(self.camera_index)
+        # Önce V4L2 backend dene, olmazsa varsayılan dene
+        self.cap = cv2.VideoCapture(self.camera_index, cv2.CAP_V4L2)
+        if not self.cap.isOpened():
+            self.cap = cv2.VideoCapture(self.camera_index)
 
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
         self.cap.set(cv2.CAP_PROP_FPS, self.fps)
 
         if not self.cap.isOpened():
-            self.get_logger().error('Kamera açılamadı.')
+            self.get_logger().error(f'Kamera (index: {self.camera_index}) açılamadı. Başka bir süreç kamerayı kullanıyor olabilir.')
         else:
-            self.get_logger().info('Kamera başarıyla açıldı.')
+            self.get_logger().info(f'Kamera (index: {self.camera_index}) başarıyla açıldı.')
             self.get_logger().info(
                 f'Kamera ayarları: {self.frame_width}x{self.frame_height} @ {self.fps} FPS'
             )

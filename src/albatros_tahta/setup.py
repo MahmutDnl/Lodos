@@ -35,9 +35,12 @@ setup(
     'console_scripts': [
         'kamera_node = albatros_tahta.kamera_node:main',
         'yolo_node = albatros_tahta.yolo_node:main',
+        'yolo_mesafe_node = albatros_tahta.yolo_mesafe_node:main',
         'mesafe_sensor_node = albatros_tahta.mesafe_sensor_node:main',
         'costmap_node = albatros_tahta.costmap_node:main',
         'duba_fusion_node = albatros_tahta.duba_fusion_node:main',
+        'parkur3_target_node = albatros_tahta.parkur3_target_node:main',
+        'target_color_node = albatros_tahta.target_color_node:main',
         'imu_node = albatros_tahta.imu_node:main',
         'gps_node = albatros_tahta.gps_node:main',
         'kontrol_node = albatros_tahta.kontrol_node:main',

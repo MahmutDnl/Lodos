@@ -22,8 +22,13 @@
 
 import json
 import math
+import os
 import time
+from datetime import datetime
+from pathlib import Path as FilePath
 
+import cv2
+import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
@@ -256,6 +261,12 @@ class CostmapNode(Node):
         self.declare_parameter('global_width_m',              60.0)
         self.declare_parameter('global_height_m',             60.0)
 
+        # ─── Video Kayıt Parametreleri ───────────────────────────────────
+        self.declare_parameter('save_costmap_video',          True)
+        self.declare_parameter('costmap_video_output_dir',    '~/albatros_outputs/costmap_videos')
+        self.declare_parameter('costmap_video_fps',           5.0)
+        self.declare_parameter('costmap_video_scale',         6)
+
         self.local_res             = float(self.get_parameter('local_resolution').value)
         self.local_w               = int(self.get_parameter('local_width_cells').value)
         self.local_h               = int(self.get_parameter('local_height_cells').value)
@@ -275,6 +286,14 @@ class CostmapNode(Node):
 
         self.global_w              = int(self.global_w_m / self.global_res)
         self.global_h              = int(self.global_h_m / self.global_res)
+
+        # Video kayıt ayarları
+        self._save_video     = bool(self.get_parameter('save_costmap_video').value)
+        self._video_dir      = FilePath(str(self.get_parameter('costmap_video_output_dir').value)).expanduser()
+        self._video_fps      = max(float(self.get_parameter('costmap_video_fps').value), 1.0)
+        self._video_scale    = max(int(self.get_parameter('costmap_video_scale').value), 1)
+        self._video_writer   = None
+        self._video_path     = None
 
         # ─── Araç Local Grid Konumu ───────────────────────────────────────
         self._local_vc = int(self.local_w * self.forward_ratio)
@@ -337,6 +356,10 @@ class CostmapNode(Node):
         self.get_logger().info(f'  GPS Topic      : {GPS_TOPIC}')
         self.get_logger().info(f'  IMU Topic      : {IMU_TOPIC}')
         self.get_logger().info(f'  Fusion Topic   : {FUSION_TOPIC}')
+        self.get_logger().info(f'  Video Kayıt    : {"AKTİF" if self._save_video else "KAPALI"}')
+        if self._save_video:
+            self.get_logger().info(f'  Video Dizin    : {self._video_dir}')
+            self.get_logger().info(f'  Video FPS      : {self._video_fps}')
         self.get_logger().info('=' * 60)
 
     # =========================================================================
@@ -956,8 +979,7 @@ class CostmapNode(Node):
             del self._tracked_buoys[k]
 
         # Dynamic TF Broadcast (map -> base_link)
-        if self._gps_valid or self._imu_valid:
-            self._publish_tf()
+        self._publish_tf()
 
         # Grid'leri ve Görselleştirmeleri Yayınla
         local_grid = self._build_local_grid()
@@ -969,6 +991,197 @@ class CostmapNode(Node):
 
         self._publish_course_markers_and_centerline()
         self._publish_info(local_valid)
+
+        # Video Kayıt
+        if self._save_video:
+            self._write_costmap_video_frame(local_grid, local_valid)
+
+
+    # =========================================================================
+    # Costmap Video Kayıt Fonksiyonları
+    # =========================================================================
+
+    def _render_local_grid_to_image(self, grid: list) -> np.ndarray:
+        """
+        Local costmap grid verisini renkli bir BGR görüntüye dönüştürür.
+
+        Renk Haritası:
+          COST_UNKNOWN (-1)         → Koyu gri
+          COST_FREE (0)             → Koyu yeşil
+          COST_LETHAL (100)         → Kırmızı
+          COST_TARGET (60)          → Camgöbeği (Cyan)
+          Inflation (1-75)          → Sarı-turuncu gradyan
+          Araç konumu               → Mavi üçgen
+        """
+        w, h = self.local_w, self.local_h
+
+        # BGR görüntü oluştur (küçük, sonra büyütülecek)
+        img = np.zeros((h, w, 3), dtype=np.uint8)
+
+        for r in range(h):
+            for c in range(w):
+                cost = grid[r * w + c]
+                if cost == COST_UNKNOWN:
+                    img[r, c] = (40, 40, 40)          # Koyu gri
+                elif cost == COST_FREE:
+                    img[r, c] = (30, 60, 20)           # Koyu yeşil
+                elif cost >= COST_LETHAL:
+                    img[r, c] = (0, 0, 220)            # Kırmızı (BGR)
+                elif cost == COST_TARGET:
+                    img[r, c] = (200, 200, 0)          # Cyan (BGR)
+                elif cost > 0:
+                    # Inflation gradyan: düşük maliyet → sarı, yüksek → turuncu
+                    ratio = min(cost / float(COST_INFLATION_MAX), 1.0)
+                    b = 0
+                    g = int(200 * (1.0 - ratio * 0.7))
+                    r_val = int(80 + 170 * ratio)
+                    img[r, c] = (b, g, r_val)
+                else:
+                    img[r, c] = (40, 40, 40)
+
+        # Araç konumu (mavi üçgen) çiz
+        vc, vr = self._local_vc, self._local_vr
+        if 0 <= vc < w and 0 <= vr < h:
+            # Küçük üçgen ok çiz (araç ileri yönü = sağa doğru = +col)
+            pts = np.array([
+                [vc + 2, vr],      # İleri uç
+                [vc - 1, vr - 1],  # Sol arka
+                [vc - 1, vr + 1],  # Sağ arka
+            ], dtype=np.int32)
+            cv2.fillPoly(img, [pts], (255, 180, 0))  # Açık mavi (BGR)
+
+        # Büyüt (scale x)
+        scale = self._video_scale
+        img_large = cv2.resize(img, (w * scale, h * scale),
+                               interpolation=cv2.INTER_NEAREST)
+
+        # ── Füzyon engel konumlarını etiketle ────────────────────────────
+        for obs in self._latest_fusion_obstacles:
+            lx = obs.get('x_m')
+            ly = obs.get('y_m')
+            obs_type = str(obs.get('type', 'unknown'))
+            class_name = str(obs.get('class_name', 'unknown'))
+            if lx is None or ly is None:
+                continue
+
+            cell = local_xy_to_grid(
+                lx, ly, self.local_res, w, h,
+                self._local_vc, self._local_vr
+            )
+            if cell is None:
+                continue
+
+            col, row = cell
+            px = int(col * scale + scale // 2)
+            py = int(row * scale + scale // 2)
+
+            # Tür bazlı renk (BGR)
+            if obs_type == 'obstacle_buoy':
+                dot_color = (0, 255, 255)   # Sarı
+            elif obs_type == 'border_buoy':
+                dot_color = (0, 140, 255)   # Turuncu
+            elif obs_type == 'target_buoy':
+                dot_color = (0, 220, 0)     # Yeşil
+            elif obs_type == 'goal_buoy':
+                dot_color = (255, 120, 50)  # Mavi
+            else:
+                dot_color = (180, 180, 180) # Gri
+
+            cv2.circle(img_large, (px, py), scale, dot_color, -1)
+            # Etiket yaz
+            label = class_name.replace('_', ' ').upper()
+            cv2.putText(img_large, label,
+                        (px + scale + 2, py + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1,
+                        cv2.LINE_AA)
+
+        # ── Bilgi yazıları (üst panel) ───────────────────────────────────
+        panel_h = 60
+        img_with_panel = np.zeros((img_large.shape[0] + panel_h,
+                                   img_large.shape[1], 3), dtype=np.uint8)
+        img_with_panel[panel_h:, :] = img_large
+
+        # Panel arka planı koyu gri
+        img_with_panel[:panel_h, :] = (30, 30, 30)
+
+        confirmed = sum(1 for b in self._tracked_buoys.values() if b.status == 'CONFIRMED')
+        tentative = len(self._tracked_buoys) - confirmed
+        fusion_age = (time.time() - self._last_fusion_time) if self._last_fusion_time else -1.0
+        local_obs = len(self._latest_fusion_obstacles)
+        yaw_deg = math.degrees(self._vehicle_yaw)
+
+        line1 = (f"ALBATROS COSTMAP | Pos: ({self._vehicle_x:.1f}, {self._vehicle_y:.1f}) m"
+                 f" | Yaw: {yaw_deg:.0f} deg")
+        line2 = (f"Local Obs: {local_obs} | Confirmed: {confirmed}"
+                 f" | Tentative: {tentative}"
+                 f" | Fusion Age: {fusion_age:.1f}s")
+
+        cv2.putText(img_with_panel, line1, (8, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 230, 255), 1, cv2.LINE_AA)
+        cv2.putText(img_with_panel, line2, (8, 48),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 220, 180), 1, cv2.LINE_AA)
+
+        # ── Renk haritası açıklaması (alt sağ köşe) ──────────────────────
+        legend_items = [
+            ('Lethal',     (0, 0, 220)),
+            ('Inflation',  (0, 140, 200)),
+            ('Free',       (30, 60, 20)),
+            ('Unknown',    (40, 40, 40)),
+            ('Target',     (200, 200, 0)),
+            ('Vehicle',    (255, 180, 0)),
+        ]
+        lx_start = img_with_panel.shape[1] - 120
+        ly_start = panel_h + 8
+        for i, (lbl, clr) in enumerate(legend_items):
+            ly = ly_start + i * 16
+            cv2.rectangle(img_with_panel, (lx_start, ly), (lx_start + 10, ly + 10), clr, -1)
+            cv2.putText(img_with_panel, lbl, (lx_start + 14, ly + 9),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.33, (200, 200, 200), 1, cv2.LINE_AA)
+
+        return img_with_panel
+
+    def _init_video_writer(self, frame: np.ndarray):
+        """Video writer'ı frame boyutuna göre başlatır."""
+        try:
+            self._video_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            self._video_path = self._video_dir / f'albatros_costmap_{timestamp}.mp4'
+            h, w = frame.shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            self._video_writer = cv2.VideoWriter(
+                str(self._video_path), fourcc, self._video_fps, (w, h)
+            )
+            if not self._video_writer.isOpened():
+                self.get_logger().error(f'Costmap video yazar açılamadı: {self._video_path}')
+                self._video_writer = None
+            else:
+                self.get_logger().info(f'Costmap video kaydı başlatıldı: {self._video_path}')
+        except Exception as e:
+            self.get_logger().error(f'Costmap video yazar başlatma hatası: {e}')
+            self._video_writer = None
+
+    def _write_costmap_video_frame(self, local_grid: list, local_valid: bool):
+        """Local grid'i görüntüye çevirip video dosyasına yazar."""
+        try:
+            frame = self._render_local_grid_to_image(local_grid)
+
+            if self._video_writer is None:
+                self._init_video_writer(frame)
+
+            if self._video_writer is not None:
+                self._video_writer.write(frame)
+        except Exception as e:
+            self.get_logger().error(
+                f'Costmap video frame yazma hatası: {e}',
+                throttle_duration_sec=5.0
+            )
+
+    def destroy_node(self):
+        """Video writer'ı kapatır ve kaynakları serbest bırakır."""
+        if self._video_writer is not None:
+            self._video_writer.release()
+            self.get_logger().info(f'Costmap video kaydedildi: {self._video_path}')
+        super().destroy_node()
 
 
 # ---------------------------------------------------------------------------
