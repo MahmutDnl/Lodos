@@ -68,14 +68,16 @@ TELEM_BAUD = 57600
 CAMERA_ID = 0
 CAMERA_BACKEND = "auto" # "auto", "v4l2", "libcamera"
 
-# Dörtgen Plaka Filtre Ayarları
+# Dörtgen Plaka / Kare Filtre Ayarları
 BLUR_KERNEL = 5
 CANNY_THRESHOLD1 = 50
 CANNY_THRESHOLD2 = 150
 MIN_CONTOUR_AREA = 1000       # Görüntüdeki minimum plaka alanı (piksel)
 MAX_CONTOUR_AREA = 200000     # Görüntüdeki maksimum plaka alanı (piksel)
-ASPECT_RATIO_MIN = 0.5        # Plaka genişlik/yükseklik oranı minimum
-ASPECT_RATIO_MAX = 2.0        # Plaka genişlik/yükseklik oranı maksimum
+SQUARE_RATIO_MIN = 0.80       # minAreaRect (min(w,h)/max(w,h)) karelik oranı
+SQUARE_MIN_ANGLE = 70.0       # Köşe iç açısı minimum (derece)
+SQUARE_MAX_ANGLE = 110.0      # Köşe iç açısı maksimum (derece)
+SQUARE_SIDE_RATIO_MIN = 0.65  # Kenar uzunlukları minimum oranı (min_side/max_side)
 ROI_CENTER_RATIO = 0.75       # ROI'nin merkezdeki yüzde kaçlık bölümü kullanılacak (0.75 = %75)
 
 # HSV Renk Eşikleri (H: 0-179, S: 0-255, V: 0-255)
@@ -93,10 +95,9 @@ GREEN_HIGH = np.array([85, 255, 255])
 BLACK_LOW = np.array([0, 0, 0])
 BLACK_HIGH = np.array([179, 255, 50])
 
-# Renk Karar Ayarları
-VOTE_WINDOW = 10
-VOTE_REQUIRED = 7
-DETECTION_TIMEOUT_SEC = 5.0
+# Renk Karar ve Zamanlama Ayarları
+COLOR_CONFIRMATION_SEC = 5.0
+DETECTION_TIMEOUT_SEC = 15.0
 
 # Zamanlama ve Yeniden Bağlanma Ayarları
 PARAM_POLL_INTERVAL = 0.5
@@ -272,8 +273,53 @@ def read_param_value(conn, param_name, label, dry_run=False):
     return None
 
 # ==============================================================================
-# OPENCV GÖRÜNTÜ İŞLEME VE DÖRTGEN TESPİTİ
+# OPENCV GÖRÜNTÜ İŞLEME VE KARE PLAKA TESPİTİ
 # ==============================================================================
+
+def calculate_angle(p1, p2, p3):
+    """
+    p2 köşe noktası olmak üzere p1-p2-p3 noktaları arasındaki iç açıyı (derece cinsinden) hesaplar.
+    """
+    v1 = p1.astype(float) - p2.astype(float)
+    v2 = p3.astype(float) - p2.astype(float)
+    norm1 = np.linalg.norm(v1)
+    norm2 = np.linalg.norm(v2)
+    if norm1 < 1e-6 or norm2 < 1e-6:
+        return 0.0
+    cosine = np.dot(v1, v2) / (norm1 * norm2)
+    cosine = np.clip(cosine, -1.0, 1.0)
+    angle = np.degrees(np.arccos(cosine))
+    return angle
+
+def check_quad_angles(pts):
+    """
+    4 noktalı poligonun 4 iç açısını kontrol eder.
+    Bütün açılar [SQUARE_MIN_ANGLE, SQUARE_MAX_ANGLE] aralığında olmalıdır.
+    """
+    for i in range(4):
+        p1 = pts[i - 1]
+        p2 = pts[i]
+        p3 = pts[(i + 1) % 4]
+        angle = calculate_angle(p1, p2, p3)
+        if not (SQUARE_MIN_ANGLE <= angle <= SQUARE_MAX_ANGLE):
+            return False
+    return True
+
+def check_side_ratios(pts):
+    """
+    4 kenarın uzunluklarını hesaplar ve min_side / max_side oranının SQUARE_SIDE_RATIO_MIN üzerinde olup olmadığını doğrular.
+    """
+    sides = []
+    for i in range(4):
+        p1 = pts[i]
+        p2 = pts[(i + 1) % 4]
+        dist = np.linalg.norm(p1.astype(float) - p2.astype(float))
+        sides.append(dist)
+    min_side = min(sides)
+    max_side = max(sides)
+    if max_side < 1e-6:
+        return False
+    return (min_side / max_side) >= SQUARE_SIDE_RATIO_MIN
 
 def order_points(pts):
     """Dörtgen köşe noktalarını sırasıyla: sol-üst, sağ-üst, sağ-alt, sol-alt şeklinde dizer."""
@@ -301,6 +347,9 @@ def get_perspective_transform(image, pts):
     heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
     maxHeight = max(int(heightA), int(heightB))
 
+    if maxWidth < 1 or maxHeight < 1:
+        raise ValueError("Geçersiz genişlik/yükseklik boyutu")
+
     # Hedef koordinatlar
     dst = np.array([
         [0, 0],
@@ -312,10 +361,17 @@ def get_perspective_transform(image, pts):
     warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
     return warped
 
-def detect_quadrilateral(frame):
+def detect_square_plate(frame):
     """
-    Görüntüdeki en uygun dörtgen plakayı bulur ve perspective transform uygulanmış ROI döner.
-    Bulamazsa None döner.
+    Görüntüdeki en uygun kare plakayı tespit eder.
+    Şartlar:
+      1. Kontur 4 köşeli ve convex olmalı.
+      2. Kontur alanı MIN_CONTOUR_AREA - MAX_CONTOUR_AREA aralığında olmalı.
+      3. cv2.minAreaRect() ile karelik oranı min(w,h)/max(w,h) >= SQUARE_RATIO_MIN (0.80) olmalı.
+      4. 4 iç açısının her biri [SQUARE_MIN_ANGLE, SQUARE_MAX_ANGLE] (70°-110°) aralığında olmalı.
+      5. Kenar uzunlukları oranı min_side/max_side >= SQUARE_SIDE_RATIO_MIN (0.65) olmalı.
+    
+    Dönüş: (warped_roi, best_quad_points) veya (None, None)
     """
     # 1. 640x480 Çözünürlük
     resized = cv2.resize(frame, (640, 480))
@@ -329,7 +385,7 @@ def detect_quadrilateral(frame):
     contours, _ = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
     best_quad = None
-    max_area = 0
+    max_area = 0.0
 
     for c in contours:
         # Kontur alanı filtresi
@@ -341,15 +397,33 @@ def detect_quadrilateral(frame):
         peri = cv2.arcLength(c, True)
         approx = cv2.approxPolyDP(c, 0.02 * peri, True)
         
-        # 4 köşeli ve convex kontrolü
-        if len(approx) == 4 and cv2.isContourConvex(approx):
-            # Aspect Ratio Kontrolü
-            (x, y, w, h) = cv2.boundingRect(approx)
-            aspect_ratio = float(w) / h
-            if ASPECT_RATIO_MIN <= aspect_ratio <= ASPECT_RATIO_MAX:
-                if area > max_area:
-                    max_area = area
-                    best_quad = approx.reshape(4, 2)
+        # 1. 4 köşeli ve convex kontrolü
+        if len(approx) != 4 or not cv2.isContourConvex(approx):
+            continue
+            
+        pts = approx.reshape(4, 2)
+        
+        # 2. cv2.minAreaRect() ile karelik oranı kontrolü
+        rect = cv2.minAreaRect(approx)
+        (w, h) = rect[1]
+        if w <= 0 or h <= 0:
+            continue
+        square_ratio = min(w, h) / max(w, h)
+        if square_ratio < SQUARE_RATIO_MIN:
+            continue
+            
+        # 3. Köşe açıları kontrolü (70° - 110°)
+        if not check_quad_angles(pts):
+            continue
+            
+        # 4. Kenar uzunlukları oranı kontrolü
+        if not check_side_ratios(pts):
+            continue
+            
+        # Şartları geçen en büyük kare plakayı seç
+        if area > max_area:
+            max_area = area
+            best_quad = pts
                     
     if best_quad is not None:
         # Perspective Transform
@@ -363,7 +437,7 @@ def detect_quadrilateral(frame):
 
 def analyze_color(roi):
     """
-    Kırpılmış plaka ROI görüntüsünün rengini HSV uzayında analiz eder.
+    Kırpılmış kare plaka ROI görüntüsünün rengini HSV uzayında analiz eder.
     Baskın rengi ve maske oranlarını döner.
     """
     h, w = roi.shape[:2]
@@ -379,7 +453,7 @@ def analyze_color(roi):
     roi_pixel_count = roi_center.shape[0] * roi_center.shape[1]
     
     if roi_pixel_count <= 0:
-        return COLOR_NOT_READY, 0.0
+        return COLOR_NOT_READY, {COLOR_RED: 0.0, COLOR_GREEN: 0.0, COLOR_BLACK: 0.0}
         
     hsv = cv2.cvtColor(roi_center, cv2.COLOR_BGR2HSV)
     
@@ -437,10 +511,11 @@ def run_iha(args):
     İHA Rolü:
       1. Pixhawk'a bağlanır, COLOR_PARAM_NAME parametresinin varlığını doğrular.
       2. Başlangıçta parametreyi 0 yapar (eski renk bilgisini temizlemek için).
-      3. Kamerayı açar ve plakayı/rengi tespit etmeye çalışır.
-      4. Voting penceresi ile teyit eder.
-      5. Timeout dolarsa failsafe olarak KIRMIZI (1) yazar.
-      6. Tespit edilen rengi Pixhawk parametresine tek seferlik yazar.
+      3. Kamerayı açar ve kare plakayı/rengi tespit etmeye çalışır.
+      4. Zaman tabanlı doğrulama: Aynı renk kesintisiz 5 saniye doğrulanırsa kabul edilir.
+      5. Renk veya plaka kaybolursa 5 saniyelik sayaç 0'dan yeniden başlar.
+      6. Timeout (15s) dolarsa failsafe olarak KIRMIZI (1) yazar.
+      7. Tespit edilen rengi Pixhawk parametresine (SCR_USER1) yazar.
     """
     logger.info("==================================================")
     logger.info("               İHA ROLÜ BAŞLATILDI")
@@ -458,7 +533,6 @@ def run_iha(args):
     cap = None
     if not args.dry_run and args.simulate_color is None:
         logger.info(f"Kamera açılıyor: ID {CAMERA_ID}...")
-        # Auto backend / V4L2
         cap = cv2.VideoCapture(CAMERA_ID)
         if not cap.isOpened():
             logger.error("Kamera açılamadı!")
@@ -466,17 +540,20 @@ def run_iha(args):
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         
-    start_time = time.time()
-    vote_queue = []
+    start_time = time.monotonic()
+    candidate_color = COLOR_NOT_READY
+    candidate_start_time = None
     final_color = None
+    last_lost_logged = False
     
-    logger.info(f"Renk algılama başladı. Maksimum süre: {DETECTION_TIMEOUT_SEC} saniye...")
+    logger.info(f"Renk algılama başladı. Maksimum süre: {DETECTION_TIMEOUT_SEC}s, Kesintisiz doğrulama: {COLOR_CONFIRMATION_SEC}s...")
     
     try:
         while True:
-            elapsed_time = time.time() - start_time
+            now = time.monotonic()
+            elapsed_total = now - start_time
             
-            # Simülasyon / Dry Run Test Modu
+            # --- 1. Simülasyon / Dry-Run Test Modu ---
             if args.simulate_color is not None:
                 sim_color = args.simulate_color.lower()
                 if sim_color == "red":
@@ -487,15 +564,15 @@ def run_iha(args):
                     detected = COLOR_BLACK
                 else:
                     detected = COLOR_NOT_READY
-                
-                # Simülasyonda 1 saniye bekledikten sonra doğrudan sonuca gitsin
-                if elapsed_time > 1.0:
-                    if detected != COLOR_NOT_READY:
-                        final_color = detected
-                        logger.info(f"[SİMÜLE] Renk başarıyla simüle edildi: {COLOR_NAMES[final_color]}")
-                        break
+
+                plate_detected = (detected != COLOR_NOT_READY)
+                quad_pts = np.array([[100, 100], [300, 100], [300, 300], [100, 300]]) if plate_detected else None
+                ratios = {COLOR_RED: 0.0, COLOR_GREEN: 0.0, COLOR_BLACK: 0.0}
+                if plate_detected:
+                    ratios[detected] = 1.0
+                frame = None
             
-            # Gerçek Görüntü İşleme
+            # --- 2. Gerçek Görüntü İşleme Modu ---
             elif cap is not None:
                 ret, frame = cap.read()
                 if not ret or frame is None:
@@ -503,59 +580,89 @@ def run_iha(args):
                     time.sleep(0.05)
                     continue
                     
-                roi, quad_pts = detect_quadrilateral(frame)
+                roi, quad_pts = detect_square_plate(frame)
+                plate_detected = (roi is not None)
                 detected = COLOR_NOT_READY
                 ratios = {COLOR_RED: 0.0, COLOR_GREEN: 0.0, COLOR_BLACK: 0.0}
                 
-                if roi is not None:
+                if plate_detected:
                     detected, ratios = analyze_color(roi)
+            else:
+                # Dry run or no camera available
+                plate_detected = False
+                detected = COLOR_NOT_READY
+                ratios = {COLOR_RED: 0.0, COLOR_GREEN: 0.0, COLOR_BLACK: 0.0}
+                frame = None
+
+            # --- 3. ZAMAN TABANLI RENK DOĞRULAMA MANTIĞI ---
+            if plate_detected and detected != COLOR_NOT_READY:
+                last_lost_logged = False
+                # Eğer renk değiştiyse veya sayaç henüz başlamadıysa
+                if detected != candidate_color:
+                    candidate_color = detected
+                    candidate_start_time = now
+                    logger.info(f"Aday renk değişti: {COLOR_NAMES[candidate_color]}")
+
+                confirm_elapsed = now - candidate_start_time if candidate_start_time is not None else 0.0
                 
-                # Voting penceresine ekleme
-                vote_queue.append(detected)
-                if len(vote_queue) > VOTE_WINDOW:
-                    vote_queue.pop(0)
-                    
-                # Voting analizi
-                if len(vote_queue) == VOTE_WINDOW:
-                    for color_code in [COLOR_RED, COLOR_GREEN, COLOR_BLACK]:
-                        if vote_queue.count(color_code) >= VOTE_REQUIRED:
-                            final_color = color_code
-                            logger.info(f"✓ Renk teyit edildi (Voting: {vote_queue.count(color_code)}/{VOTE_WINDOW}): {COLOR_NAMES[final_color]}")
-                            break
-                            
-                if final_color is not None:
+                # 5 Saniye Kesintisiz Doğrulama Kontrolü
+                if confirm_elapsed >= COLOR_CONFIRMATION_SEC:
+                    final_color = candidate_color
+                    logger.info(f"✓ Renk {COLOR_CONFIRMATION_SEC:.2f} saniye kesintisiz doğrulandı: {COLOR_NAMES[final_color]}")
                     break
+            else:
+                # Plaka veya renk kaybolduysa sayaç sıfırlanır
+                if candidate_color != COLOR_NOT_READY:
+                    if not last_lost_logged:
+                        logger.info("Kare plaka kayboldu. Renk doğrulama sayacı sıfırlandı.")
+                        last_lost_logged = True
+                candidate_color = COLOR_NOT_READY
+                candidate_start_time = None
+                confirm_elapsed = 0.0
+
+            # --- 4. DEBUG EKRANI ---
+            if args.debug and frame is not None:
+                debug_frame = cv2.resize(frame, (640, 480))
+                if quad_pts is not None:
+                    # Kare plaka kabul edildiyse YEŞİL kontur çiz
+                    cv2.drawContours(debug_frame, [quad_pts.astype(int)], -1, (0, 255, 0), 2)
                     
-                # Debug penceresi
-                if args.debug:
-                    debug_frame = cv2.resize(frame, (640, 480))
-                    if quad_pts is not None:
-                        cv2.drawContours(debug_frame, [quad_pts.astype(int)], -1, (0, 255, 0), 2)
-                        
-                    # Yazıları ekrana ekleyelim
-                    text_y = 30
-                    for c_code, ratio in ratios.items():
-                        cv2.putText(debug_frame, f"{COLOR_NAMES[c_code]}: {ratio:.2f}", (10, text_y), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                        text_y += 25
-                        
-                    cv2.putText(debug_frame, f"Voting: {vote_queue}", (10, text_y), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                    cv2.putText(debug_frame, f"Sure: {elapsed_time:.1f}/{DETECTION_TIMEOUT_SEC}s", (10, 450), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                                
-                    cv2.imshow("LODOS IHA DEBUG", debug_frame)
-                    if cv2.waitKey(1) & 0xFF == ord('q'):
-                        logger.info("Debug penceresi kullanıcı tarafından kapatıldı.")
-                        break
-                        
-            # Timeout Failsafe Kontrolü
-            if elapsed_time >= DETECTION_TIMEOUT_SEC:
-                logger.warning(f"Zaman aşımı ({DETECTION_TIMEOUT_SEC}s) doldu! Renk algılanamadı veya kararsız.")
+                plate_str = "DETECTED" if plate_detected else "NOT DETECTED"
+                detected_str = COLOR_NAMES[detected]
+                candidate_str = COLOR_NAMES[candidate_color]
+                current_confirm = (now - candidate_start_time) if (candidate_start_time is not None and candidate_color != COLOR_NOT_READY) else 0.0
+
+                text_y = 25
+                cv2.putText(debug_frame, f"PLATE: {plate_str}", (10, text_y), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2); text_y += 20
+                cv2.putText(debug_frame, f"SHAPE: SQUARE", (10, text_y), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1); text_y += 20
+                cv2.putText(debug_frame, f"DETECTED COLOR: {detected_str}", (10, text_y), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1); text_y += 20
+                cv2.putText(debug_frame, f"CANDIDATE COLOR: {candidate_str}", (10, text_y), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1); text_y += 20
+                cv2.putText(debug_frame, f"CONFIRMATION: {current_confirm:.2f} / {COLOR_CONFIRMATION_SEC:.2f} s", (10, text_y), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2); text_y += 25
+
+                for c_code, ratio in ratios.items():
+                    cv2.putText(debug_frame, f"{COLOR_NAMES[c_code]}: {ratio:.2f}", (10, text_y), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1); text_y += 20
+
+                cv2.putText(debug_frame, f"TOTAL TIME: {elapsed_total:.1f} / {DETECTION_TIMEOUT_SEC:.1f} s", (10, 465), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+
+                cv2.imshow("LODOS IHA DEBUG", debug_frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    logger.info("Debug penceresi kullanıcı tarafından kapatıldı.")
+                    break
+
+            # --- 5. TIMEOUT FAILSAFE KONTROLÜ ---
+            if elapsed_total >= DETECTION_TIMEOUT_SEC:
+                logger.warning(f"Zaman aşımı ({DETECTION_TIMEOUT_SEC}s) doldu! Renk algılanamadı veya 5 saniye kesintisiz doğrulanamadı.")
                 logger.warning("Failsafe devreye giriyor: Rengi KIRMIZI kabul ediyoruz.")
                 final_color = COLOR_RED
                 break
-                
+
             time.sleep(0.03) # ~30 FPS
             
     except KeyboardInterrupt:
@@ -664,8 +771,6 @@ def run_parkur3(target_color):
     Geliştiriciler kendi Parkur-3 algoritmasını buraya entegre edebilir.
     """
     logger.info(f"[PARKUR3] Otonom Parkur-3 görevi başlıyor. Hedef renk duba: {target_color.upper()}")
-    # Burada motor veya dümen komutları üretilmez. Bu kısım araç üzerindeki otonom karar mekanizmasıdır.
-    # Örnek logic:
     if target_color == "red":
         logger.info("[PARKUR3] KIRMIZI duba hedeflendi. İlerleniyor...")
     elif target_color == "green":
