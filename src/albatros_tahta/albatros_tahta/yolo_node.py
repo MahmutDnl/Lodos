@@ -72,11 +72,14 @@ class YoloNode(Node):
         self.declare_parameter("processed_image_topic", "/albatros/kamera/processed")
         self.declare_parameter("detections_topic", "/albatros/yolo/tespitler")
         self.declare_parameter("obstacles_topic", "/albatros/yolo/obstacles")
-        self.declare_parameter("status_topic", "/albatros/yolo/status")
+        self.declare_parameter("status_topic", "/albatros/yolo/model_status")
 
-        self.declare_parameter("model_path", "models/parkur12.hef")
+        self.declare_parameter("model_path", "models/parkur_1_2.hef")
+        self.declare_parameter("parkur_1_2_model", "models/parkur_1_2.hef")
         self.declare_parameter("parkur12_model_path", "models/parkur12.hef")
-        self.declare_parameter("parkur3_model_path", "models/parkur3.hef")
+        self.declare_parameter("parkur_3_model", "models/parkur_3.hef")
+        self.declare_parameter("parkur3_model_path", "models/parkur_3.hef")
+        self.declare_parameter("mission_status_timeout_sec", 2.0)
 
         # Global YOLO confidence threshold (0.30 canonical value across all parkours)
         self.declare_parameter("confidence_threshold", 0.30)
@@ -86,7 +89,7 @@ class YoloNode(Node):
         self.declare_parameter("model_input_height", 640)
         self.declare_parameter("model_switch_debounce_sec", 0.5)
 
-        self.declare_parameter("save_video", False)
+        self.declare_parameter("save_video", True)
         self.declare_parameter("video_output_dir", "~/albatros_outputs/videos")
         self.declare_parameter("video_fps", 10.0)
 
@@ -100,9 +103,16 @@ class YoloNode(Node):
         self.obstacles_topic = str(self.get_parameter("obstacles_topic").value)
         self.status_topic = str(self.get_parameter("status_topic").value)
 
-        self.parkur12_model_path_param = str(self.get_parameter("parkur12_model_path").value)
-        self.parkur3_model_path_param = str(self.get_parameter("parkur3_model_path").value)
+        p12_val = str(self.get_parameter("parkur_1_2_model").value)
+        p12_alt = str(self.get_parameter("parkur12_model_path").value)
+        self.parkur12_model_path_param = p12_alt if p12_alt and p12_alt != "models/parkur12.hef" else p12_val
+
+        p3_val = str(self.get_parameter("parkur_3_model").value)
+        p3_alt = str(self.get_parameter("parkur3_model_path").value)
+        self.parkur3_model_path_param = p3_alt if p3_alt and p3_alt != "models/parkur_3.hef" else p3_val
+
         self.legacy_model_path_param = str(self.get_parameter("model_path").value)
+        self.mission_status_timeout_sec = float(self.get_parameter("mission_status_timeout_sec").value)
 
         # Confidence eşiğini 0.30 kabul et
         conf_val = float(self.get_parameter("yolo_conf_threshold").value)
@@ -215,6 +225,10 @@ class YoloNode(Node):
         # ─── Worker Thread ──────────────────────────────────────────────────
         self.worker_thread = threading.Thread(target=self.inference_worker, daemon=True)
         self.worker_thread.start()
+
+        self.last_mission_status_time = 0.0
+        self.current_parkur = 0  # PARKUR_UNKNOWN
+        self.timeout_timer = self.create_timer(1.0, self._check_mission_timeout)
 
         self._publish_status()
 
@@ -344,8 +358,13 @@ class YoloNode(Node):
                 "Parkur 1/2 modeli ile node çalışmaya devam ediyor. Parkur3 model switching pasif."
             )
 
-        # İlk Başlangıç Modelini Yükle (parkur12)
-        self.load_hef_pipeline(self.parkur12_resolved_path, "parkur12")
+        # Standalone ve varsayılan kullanım için parkur12 modelini yükle
+        if self.parkur12_available:
+            self.get_logger().info("[YOLO] Varsayılan model olarak 'parkur12' yükleniyor...")
+            self.load_hef_pipeline(self.parkur12_resolved_path, "parkur12")
+        else:
+            self.active_model_name = None
+            self.get_logger().info("[YOLO] Mission bilgisi bekleniyor. Model henüz aktif değil.")
 
         # Startup Özeti Logla
         self._print_startup_banner()
@@ -470,12 +489,24 @@ class YoloNode(Node):
     # Mission Status / Vehicle State Callback'leri
     # =========================================================================
 
-    def _evaluate_model_switch_request(self, current_parkur: int, mission_state_str: str):
-        mission_state_upper = str(mission_state_str).upper()
+    def _check_mission_timeout(self):
+        if self.last_mission_status_time > 0 and (time.time() - self.last_mission_status_time > self.mission_status_timeout_sec):
+            if self.active_model_name != "parkur12" and self.parkur12_available:
+                self.get_logger().warn("[YOLO] Mission bilgisi zaman aşımı! 'parkur12' varsayılan modeline dönülüyor.")
+                self.switch_hailo_model("parkur12")
 
-        if current_parkur == 3 or "PARKUR3" in mission_state_upper or "PARKUR_3" in mission_state_upper:
+    def _evaluate_model_switch_request(self, current_parkur: int, mission_state_str: str):
+        self.last_mission_status_time = time.time()
+        self.current_parkur = current_parkur
+
+        p1 = MissionStatus.PARKUR_1 if MissionStatus else 1
+        p2 = MissionStatus.PARKUR_2 if MissionStatus else 2
+        p3 = MissionStatus.PARKUR_3 if MissionStatus else 3
+
+        if current_parkur == p3:
             target_model = "parkur3"
         else:
+            # Parkur 1, Parkur 2 veya varsayılan/bilinmeyen (0) durumda parkur12 aktif kalır
             target_model = "parkur12"
 
         if target_model != self.active_model_name:
@@ -484,7 +515,14 @@ class YoloNode(Node):
                 self.pending_requested_model = target_model
                 self.last_model_switch_request_time = now
             elif now - self.last_model_switch_request_time >= self.model_switch_debounce_sec:
-                self.switch_hailo_model(target_model)
+                if target_model is None:
+                    self.get_logger().info(f"[YOLO] Bilinmeyen parkur ({current_parkur}). Inference durduruluyor.")
+                    self._cleanup_hailo_pipeline()
+                    self.active_model_name = None
+                    self.pending_requested_model = None
+                    self._publish_status()
+                else:
+                    self.switch_hailo_model(target_model)
 
     def mission_status_callback(self, msg):
         self._evaluate_model_switch_request(msg.current_parkur, msg.mission_state)
@@ -631,7 +669,14 @@ class YoloNode(Node):
 
     def postprocess_results(self, results, stamp_float):
         """
-        Hailo çıkışlarını okur ve GLOBAL confidence eşiğini (>= 0.30) uygular.
+        Hailo NMS çıkışlarını okur ve GLOBAL confidence eşiğini (>= 0.30) uygular.
+
+        Desteklenen formatlar (öncelik sırasıyla):
+          A. list-of-ndarray: [ndarray(N0,5), ndarray(N1,5), ...]
+             Her liste elemanı bir sınıfa ait, class_id = index.
+             Her satır: [ymin, xmin, ymax, xmax, confidence]
+          B. ndarray 3D: shape=(num_classes, 5, max_detections)
+          C. ndarray 2D: shape=(N, 6) — [ymin, xmin, ymax, xmax, confidence, class_id]
         """
         detections = []
         scale = self._preprocess_scale
@@ -639,97 +684,215 @@ class YoloNode(Node):
         dy = self._preprocess_dy
         orig_w, orig_h = self._original_size
 
-        nms_output = None
-        for info in self.hef.get_output_vstream_infos():
-            out_tensor = results[info.name][0]
-            if "nms" in info.name.lower() or out_tensor.shape[-1] == 6:
-                nms_output = out_tensor
-                break
-
-        if nms_output is None and len(self.hef.get_output_vstream_infos()) > 0:
-            info = self.hef.get_output_vstream_infos()[0]
-            out_tensor = results[info.name][0]
-            if out_tensor.shape[-1] == 6:
-                nms_output = out_tensor
-
         class_map = self.class_mappings.get(self.active_model_name, self.class_mappings["parkur12"])
 
-        if nms_output is not None:
-            for box in nms_output:
-                if len(box) >= 6:
-                    ymin, xmin, ymax, xmax, confidence, class_id = box[:6]
+        # ── NMS çıkış tensörünü bul ──────────────────────────────────────────
+        nms_output = None
+        nms_output_name = None
+        for info in self.hef.get_output_vstream_infos():
+            out_tensor = results[info.name][0]
+            if "nms" in info.name.lower():
+                nms_output = out_tensor
+                nms_output_name = info.name
+                break
 
-                    # Global 0.30 Confidence Filtresi
-                    if confidence < self.confidence_threshold:
-                        continue
+        # Eğer "nms" adında output yoksa eski 6-elemanlı format kontrolü (güvenli)
+        if nms_output is None:
+            for info in self.hef.get_output_vstream_infos():
+                out_tensor = results[info.name][0]
+                try:
+                    if hasattr(out_tensor, 'ndim') and out_tensor.ndim == 2 and out_tensor.shape[-1] == 6:
+                        nms_output = out_tensor
+                        nms_output_name = info.name
+                        break
+                except Exception:
+                    pass
 
-                    class_id = int(class_id)
-                    if class_id in class_map:
-                        class_name = class_map[class_id]
-                    else:
-                        self.get_logger().warn(
-                            f"[WARN] Bilinmeyen class_id={class_id} (Aktif model: '{self.active_model_name}')",
-                            throttle_duration_sec=5.0
-                        )
-                        class_name = f"unknown_{class_id}"
-
-                    if xmax <= 1.0 and ymax <= 1.0:
-                        xmin_px = xmin * self.model_input_width
-                        xmax_px = xmax * self.model_input_width
-                        ymin_px = ymin * self.model_input_height
-                        ymax_px = ymax * self.model_input_height
-                    else:
-                        xmin_px, ymin_px, xmax_px, ymax_px = xmin, ymin, xmax, ymax
-
-                    x1 = int((xmin_px - dx) / scale)
-                    y1 = int((ymin_px - dy) / scale)
-                    x2 = int((xmax_px - dx) / scale)
-                    y2 = int((ymax_px - dy) / scale)
-
-                    x1 = max(0, min(x1, orig_w - 1))
-                    y1 = max(0, min(y1, orig_h - 1))
-                    x2 = max(0, min(x2, orig_w - 1))
-                    y2 = max(0, min(y2, orig_h - 1))
-
-                    if x1 > x2:
-                        x1, x2 = x2, x1
-                    if y1 > y2:
-                        y1, y2 = y2, y1
-
-                    width = int(x2 - x1)
-                    height = int(y2 - y1)
-
-                    if width <= 0 or height <= 0:
-                        continue
-
-                    cx = int((x1 + x2) / 2)
-                    cy = int((y1 + y2) / 2)
-
-                    detection = {
-                        "stamp": stamp_float,
-                        "class_id": class_id,
-                        "class_name": class_name,
-                        "confidence": float(confidence),
-                        "model_active": self.active_model_name,
-                        "bbox": {
-                            "x_min": x1,
-                            "y_min": y1,
-                            "x_max": x2,
-                            "y_max": y2,
-                            "width": width,
-                            "height": height
-                        },
-                        "center": {
-                            "x": cx,
-                            "y": cy
-                        }
-                    }
-                    detections.append(detection)
-        else:
+        if nms_output is None:
             self.get_logger().warn(
                 "NMS output format mismatch. Ensure HEF format is supported.",
                 throttle_duration_sec=5.0
             )
+            return detections
+
+        # ══════════════════════════════════════════════════════════════════════
+        # Format tespiti, diagnostik ve decode
+        # ══════════════════════════════════════════════════════════════════════
+        raw_boxes = []  # Her eleman: (class_id, ymin, xmin, ymax, xmax, confidence)
+
+        try:
+            is_ndarray = isinstance(nms_output, np.ndarray)
+
+            # ── FORMAT A: list-of-ndarray (Hailo runtime gerçek çıktısı) ─────
+            # nms_output = [ndarray(N0,5), ndarray(N1,5), ...]
+            # Her liste elemanı bir sınıfa ait, class_id = liste index'i
+            # Her satır: [ymin, xmin, ymax, xmax, confidence]
+            is_list_of_ndarray = (
+                isinstance(nms_output, list)
+                and len(nms_output) > 0
+                and all(isinstance(a, np.ndarray) for a in nms_output)
+            )
+
+            if is_list_of_ndarray:
+                num_classes = len(nms_output)
+
+                # İlk inference diagnostik (bir kez)
+                if not getattr(self, '_postprocess_diag_logged', False):
+                    self._postprocess_diag_logged = True
+                    diag_lines = [
+                        f"[YOLO-PP] list-of-ndarray NMS format: {num_classes} sınıf"
+                    ]
+                    for cls_idx in range(num_classes):
+                        cls_arr = nms_output[cls_idx]
+                        cls_label = class_map.get(cls_idx, f"unknown_{cls_idx}")
+                        if cls_arr.ndim == 2 and cls_arr.shape[0] > 0:
+                            max_conf = float(np.max(cls_arr[:, 4]))
+                        else:
+                            max_conf = 0.0
+                        diag_lines.append(
+                            f"  class[{cls_idx}] '{cls_label}': "
+                            f"shape={cls_arr.shape}, max_conf={max_conf:.4f}"
+                        )
+                    for line in diag_lines:
+                        self.get_logger().info(line)
+
+                for class_id, class_detections in enumerate(nms_output):
+                    if class_detections.ndim != 2 or class_detections.shape[0] == 0:
+                        continue
+                    for det in class_detections:
+                        ymin, xmin, ymax, xmax, confidence = det[:5]
+                        confidence = float(confidence)
+                        if confidence < self.confidence_threshold:
+                            continue
+                        raw_boxes.append((class_id, float(ymin), float(xmin),
+                                          float(ymax), float(xmax), confidence))
+
+            # ── FORMAT B: ndarray 3D (C, 5, N) ──────────────────────────────
+            elif is_ndarray and nms_output.ndim == 3 and nms_output.shape[1] == 5:
+                num_classes = nms_output.shape[0]
+                num_dets = nms_output.shape[2]
+
+                if not getattr(self, '_postprocess_diag_logged', False):
+                    self._postprocess_diag_logged = True
+                    diag_lines = [f"[YOLO-PP] 3D NMS format: ({num_classes}, 5, {num_dets})"]
+                    for cls_idx in range(num_classes):
+                        conf_slice = nms_output[cls_idx, 4, :]
+                        max_conf = float(np.max(conf_slice)) if num_dets > 0 else 0.0
+                        cls_label = class_map.get(cls_idx, f"unknown_{cls_idx}")
+                        diag_lines.append(
+                            f"  class[{cls_idx}] '{cls_label}': max_conf={max_conf:.4f}"
+                        )
+                    for line in diag_lines:
+                        self.get_logger().info(line)
+
+                for cls_idx in range(num_classes):
+                    for det_idx in range(num_dets):
+                        confidence = float(nms_output[cls_idx, 4, det_idx])
+                        if confidence < self.confidence_threshold:
+                            continue
+                        ymin = float(nms_output[cls_idx, 0, det_idx])
+                        xmin = float(nms_output[cls_idx, 1, det_idx])
+                        ymax = float(nms_output[cls_idx, 2, det_idx])
+                        xmax = float(nms_output[cls_idx, 3, det_idx])
+                        raw_boxes.append((cls_idx, ymin, xmin, ymax, xmax, confidence))
+
+            # ── FORMAT C: ndarray 2D (N, 6) — eski flat NMS ─────────────────
+            elif is_ndarray and nms_output.ndim == 2 and nms_output.shape[-1] >= 6:
+                if not getattr(self, '_postprocess_diag_logged', False):
+                    self._postprocess_diag_logged = True
+                    self.get_logger().info(
+                        f"[YOLO-PP] Eski 2D NMS format: shape={nms_output.shape}"
+                    )
+
+                for box in nms_output:
+                    ymin, xmin, ymax, xmax, confidence, class_id = box[:6]
+                    confidence = float(confidence)
+                    if confidence < self.confidence_threshold:
+                        continue
+                    raw_boxes.append((int(class_id), float(ymin), float(xmin),
+                                      float(ymax), float(xmax), confidence))
+
+            else:
+                shape_info = (nms_output.shape if is_ndarray
+                              else f"<{type(nms_output).__name__}, len={len(nms_output) if hasattr(nms_output, '__len__') else '?'}>")
+                self.get_logger().warn(
+                    f"[YOLO-PP] Tanınmayan NMS çıktı formatı: {shape_info}. "
+                    "Desteklenen: list-of-ndarray, ndarray (C,5,N), ndarray (N,6).",
+                    throttle_duration_sec=5.0
+                )
+                return detections
+
+        except Exception as e:
+            self.get_logger().error(
+                f"[YOLO-PP] NMS decode sırasında hata: {e}",
+                throttle_duration_sec=2.0
+            )
+            return detections
+
+        # ── Ortak bbox dönüşüm ve detection oluşturma ────────────────────────
+        for (class_id, ymin, xmin, ymax, xmax, confidence) in raw_boxes:
+
+            if class_id in class_map:
+                class_name = class_map[class_id]
+            else:
+                self.get_logger().warn(
+                    f"[WARN] Bilinmeyen class_id={class_id} (Aktif model: '{self.active_model_name}')",
+                    throttle_duration_sec=5.0
+                )
+                class_name = f"unknown_{class_id}"
+
+            if xmax <= 1.0 and ymax <= 1.0:
+                xmin_px = xmin * self.model_input_width
+                xmax_px = xmax * self.model_input_width
+                ymin_px = ymin * self.model_input_height
+                ymax_px = ymax * self.model_input_height
+            else:
+                xmin_px, ymin_px, xmax_px, ymax_px = xmin, ymin, xmax, ymax
+
+            x1 = int((xmin_px - dx) / scale)
+            y1 = int((ymin_px - dy) / scale)
+            x2 = int((xmax_px - dx) / scale)
+            y2 = int((ymax_px - dy) / scale)
+
+            x1 = max(0, min(x1, orig_w - 1))
+            y1 = max(0, min(y1, orig_h - 1))
+            x2 = max(0, min(x2, orig_w - 1))
+            y2 = max(0, min(y2, orig_h - 1))
+
+            if x1 > x2:
+                x1, x2 = x2, x1
+            if y1 > y2:
+                y1, y2 = y2, y1
+
+            width = int(x2 - x1)
+            height = int(y2 - y1)
+
+            if width <= 0 or height <= 0:
+                continue
+
+            cx = int((x1 + x2) / 2)
+            cy = int((y1 + y2) / 2)
+
+            detection = {
+                "stamp": stamp_float,
+                "class_id": class_id,
+                "class_name": class_name,
+                "confidence": float(confidence),
+                "model_active": self.active_model_name,
+                "bbox": {
+                    "x_min": x1,
+                    "y_min": y1,
+                    "x_max": x2,
+                    "y_max": y2,
+                    "width": width,
+                    "height": height
+                },
+                "center": {
+                    "x": cx,
+                    "y": cy
+                }
+            }
+            detections.append(detection)
 
         return detections
 
@@ -833,13 +996,18 @@ class YoloNode(Node):
             return
         self._last_status_pub_time = now
 
+        active_model_str = None
+        if self.active_model_name == "parkur12":
+            active_model_str = "parkur_1_2.hef"
+        elif self.active_model_name == "parkur3":
+            active_model_str = "parkur_3.hef"
+
         payload = {
+            "current_parkur": getattr(self, "current_parkur", 0),
+            "active_model": active_model_str,
+            "model_loaded": self.infer_pipeline is not None,
+            "switching": (self.pending_requested_model is not None and self.pending_requested_model != self.active_model_name),
             "ready": HAILO_AVAILABLE and self.infer_pipeline is not None,
-            "hailo_ready": HAILO_AVAILABLE,
-            "active_model": self.active_model_name,
-            "parkur12_available": self.parkur12_available,
-            "parkur3_available": self.parkur3_available,
-            "confidence_threshold": self.confidence_threshold,
             "last_inference_ok": self._last_inference_ok,
         }
 

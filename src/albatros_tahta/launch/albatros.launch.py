@@ -90,11 +90,26 @@ def generate_launch_description():
         name='yolo_node',
         output='screen',
         parameters=[{
+            'parkur_1_2_model': default_parkur12_hef,
             'parkur12_model_path': default_parkur12_hef,
+            'parkur_3_model': default_parkur3_hef,
             'parkur3_model_path': default_parkur3_hef,
             'confidence_threshold': 0.30,
             'model_input_width': 640,
             'model_input_height': 640,
+            'save_video': True,
+            'video_output_dir': '~/albatros_outputs/yolo_videos',
+            'video_fps': 10.0,
+        }],
+    )
+
+    yolo_mesafe_node = Node(
+        package=pkg,
+        executable='yolo_mesafe_node',
+        name='yolo_mesafe_node',
+        output='screen',
+        parameters=[{
+            'min_yolo_confidence': 0.30,
         }],
     )
 
@@ -275,6 +290,7 @@ def generate_launch_description():
             actions=[
                 LogInfo(msg='[LAUNCH] Algılama katmanı (YOLO & Parkur3 perception) başlatılıyor...'),
                 yolo_node,
+                yolo_mesafe_node,
                 parkur3_target_node,
                 duba_fusion_node,
                 costmap_node,

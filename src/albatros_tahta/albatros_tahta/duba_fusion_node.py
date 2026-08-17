@@ -196,7 +196,7 @@ class DubaFusionNode(Node):
         self.declare_parameter('output_topic',
                                '/albatros/fusion/obstacles')
 
-        self.declare_parameter('min_yolo_confidence',      0.60)
+        self.declare_parameter('min_yolo_confidence',      0.30)
         self.declare_parameter('sensor_timeout_sec',       0.50)
         self.declare_parameter('max_time_difference_sec',  0.50)
         self.declare_parameter('max_distance_difference_m', 1.50)
