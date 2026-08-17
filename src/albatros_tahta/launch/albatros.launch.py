@@ -205,35 +205,41 @@ def generate_launch_description():
     )
 
     # ╔══════════════════════════════════════════════════════════════════╗
-    # ║  4. KARAR ve KONTROL KATMANI                                   ║
-    # ║  VFH engel kaçınma kararı, MAVROS motor komutu icrası          ║
+    # ║  4. KOMUT ve KONTROL KATMANI                                    ║
+    # ║  Waypoint takibi, VFH engel kaçınma, MAVROS motor komutu        ║
     # ╚══════════════════════════════════════════════════════════════════╝
 
-    karar_node = Node(
+    # NOT: komut_node, eski karar_node'un görevini devralmıştır.
+    # Parkur 1 (saf PID) ve Parkur 2 (VFH) navigasyonunu birleştirir.
+    # Waypoint listesi komut_node.py dosyasının başında tanımlıdır.
+    komut_node = Node(
         package=pkg,
-        executable='karar_node',
-        name='karar_node',
+        executable='komut_node',
+        name='komut_node',
         output='screen',
         parameters=[{
-            'sector_count': 72,
-            'vfh_threshold': 0.35,
-            'active_region_radius': 6.0,
-            'vehicle_width': 0.85,
-            'safety_margin': 0.50,
+            # Genel navigasyon
+            'publish_rate': 10.0,
+            'wp_radius_m': 2.5,
             'max_linear_speed': 1.0,
             'min_linear_speed': 0.2,
             'max_angular_speed': 0.8,
+            'steering_kp': 1.2,
+            'slowdown_distance_m': 4.0,
+            'state_timeout_sec': 2.0,
+            'gps_timeout_sec': 2.0,
+            # VFH parametreleri (Parkur 2)
+            'sector_count': 72,
+            'vfh_threshold': 0.35,
+            'active_region_radius_m': 6.0,
+            'vehicle_width_m': 0.60,
+            'safety_margin_m': 0.40,
+            'costmap_timeout_sec': 1.5,
+            'emergency_stop_distance_m': 0.8,
             'cost_goal_weight': 5.0,
             'cost_current_weight': 2.0,
             'cost_previous_weight': 2.0,
             'cost_clearance_weight': 3.0,
-            'slowdown_distance': 2.0,
-            'emergency_stop_distance_m': 1.0,
-            'unknown_is_blocked': False,
-            'publish_rate': 10.0,
-            'steering_kp': 1.5,
-            'costmap_timeout_sec': 1.5,
-            'state_timeout_sec': 2.0,
         }],
     )
 
@@ -288,8 +294,8 @@ def generate_launch_description():
         TimerAction(
             period=3.0,
             actions=[
-                LogInfo(msg='[LAUNCH] Karar ve kontrol katmanı (VFH Avoidance & Motor Command) başlatılıyor...'),
-                karar_node,
+                LogInfo(msg='[LAUNCH] Komut ve kontrol katmanı (Navigasyon & Motor) başlatılıyor...'),
+                komut_node,
                 kontrol_node,
                 LogInfo(msg='═══════════════════════════════════════════════════'),
                 LogInfo(msg='  LODOS Albatros İDA — Tüm Node\'lar Başlatıldı!  '),

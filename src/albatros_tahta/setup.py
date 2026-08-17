@@ -44,6 +44,7 @@ setup(
         'mission_node = albatros_tahta.mission_node:main',
         'state_node = albatros_tahta.state_node:main',
         'karar_node = albatros_tahta.karar_node:main',
+        'komut_node = albatros_tahta.komut_node:main',
     ],
     }
 )
