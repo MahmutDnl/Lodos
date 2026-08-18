@@ -235,10 +235,10 @@ def generate_launch_description():
         parameters=[{
             # Genel navigasyon
             'publish_rate': 10.0,
-            'max_linear_speed': 1.0,
-            'min_linear_speed': 0.4,
-            'max_angular_speed': 0.8,
-            'steering_kp': 1.2,
+            'max_linear_speed': 2.5,
+            'min_linear_speed': 0.8,
+            'max_angular_speed': 3.0,
+            'steering_kp': 2.5,
             'slowdown_distance_m': 4.0,
             'state_timeout_sec': 2.0,
             # VFH parametreleri (Parkur 2)
@@ -265,8 +265,8 @@ def generate_launch_description():
             'publish_rate': 20.0,
             'command_timeout_sec': 0.5,
             'sensor_timeout_sec': 2.0,
-            'max_linear_speed': 1.5,
-            'max_angular_speed': 1.0,
+            'max_linear_speed': 3.0,
+            'max_angular_speed': 3.0,
             'require_gps': True,
             'require_imu': True,
         }],
