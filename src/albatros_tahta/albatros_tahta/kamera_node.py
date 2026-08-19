@@ -159,7 +159,8 @@ class CameraNode(Node):
                 self.consecutive_failures = 0
 
     def destroy_node(self):
-        self.cap.release()
+        if self.cap is not None:
+            self.cap.release()
         super().destroy_node()
 
 
