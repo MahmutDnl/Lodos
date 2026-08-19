@@ -22,6 +22,7 @@ COMMAND_TOPIC = '/albatros/command/cmd_vel'
 ARM_COMMAND_TOPIC = '/albatros/command/arm'
 MODE_COMMAND_TOPIC = '/albatros/command/mode'
 EMERGENCY_STOP_TOPIC = '/albatros/command/emergency_stop'
+OBSTACLE_DETECTED_TOPIC = '/albatros/obstacle/detected'
 
 CONTROL_STATUS_TOPIC = '/albatros/control/status'
 
@@ -35,6 +36,8 @@ DEFAULT_COMMAND_TIMEOUT = 0.5
 DEFAULT_SENSOR_TIMEOUT = 2.0
 DEFAULT_MAX_LINEAR_SPEED = 1.5
 DEFAULT_MAX_ANGULAR_SPEED = 1.0
+DEFAULT_MODE_SWITCH_COOLDOWN = 2.0
+DEFAULT_MODE = 'AUTO'
 
 
 class ControlNode(Node):
@@ -77,6 +80,21 @@ class ControlNode(Node):
             True
         )
 
+        self.declare_parameter(
+            'default_mode',
+            DEFAULT_MODE
+        )
+
+        self.declare_parameter(
+            'mode_switch_cooldown_sec',
+            DEFAULT_MODE_SWITCH_COOLDOWN
+        )
+
+        self.declare_parameter(
+            'auto_mode_obstacle_switching',
+            True
+        )
+
         self.publish_rate = float(
             self.get_parameter('publish_rate').value
         )
@@ -105,6 +123,18 @@ class ControlNode(Node):
             self.get_parameter('require_imu').value
         )
 
+        self.default_mode = str(
+            self.get_parameter('default_mode').value
+        ).upper()
+
+        self.mode_switch_cooldown = float(
+            self.get_parameter('mode_switch_cooldown_sec').value
+        )
+
+        self.auto_obstacle_switching = bool(
+            self.get_parameter('auto_mode_obstacle_switching').value
+        )
+
         if self.publish_rate <= 0.0:
             self.publish_rate = DEFAULT_PUBLISH_RATE
 
@@ -124,6 +154,12 @@ class ControlNode(Node):
         self.armed = False
         self.mode = 'UNKNOWN'
         self.emergency_stop = False
+
+        # --- Hibrit AUTO/GUIDED mod geçiş durumu ---
+        self.obstacle_active = False
+        self.last_mode_switch_time = 0.0
+        self.desired_mode = self.default_mode
+        self.mode_switch_pending = False
 
         self.gps_received = False
         self.gps_valid = False
@@ -187,6 +223,13 @@ class ControlNode(Node):
             Bool,
             EMERGENCY_STOP_TOPIC,
             self.emergency_stop_callback,
+            10
+        )
+
+        self.create_subscription(
+            Bool,
+            OBSTACLE_DETECTED_TOPIC,
+            self.obstacle_detected_callback,
             10
         )
 
@@ -369,11 +412,43 @@ class ControlNode(Node):
                 'Acil durdurma kaldırıldı.'
             )
 
+    def obstacle_detected_callback(self, msg: Bool):
+        """Engel tespit sinyali callback'i.
+
+        komut_node tarafından yayınlanır. True = önde engel var.
+        Hibrit mod geçişini tetikler.
+        """
+        new_state = bool(msg.data)
+
+        if new_state != self.obstacle_active:
+            self.obstacle_active = new_state
+
+            if new_state:
+                self.get_logger().warn(
+                    '[MOD GEÇİŞ] Engel tespit edildi! '
+                    'GUIDED moda geçiş isteniyor.'
+                )
+            else:
+                self.get_logger().info(
+                    '[MOD GEÇİŞ] Engel aşıldı. '
+                    'AUTO moda geri dönüş isteniyor.'
+                )
+
     def control_callback(self):
+        # --- Hibrit mod geçiş yönetimi ---
+        if self.auto_obstacle_switching:
+            self.manage_mode_switching()
+
         if not self.control_allowed():
             self.publish_stop()
             return
 
+        # AUTO modda velocity yayını yapma —
+        # Pixhawk kendi L1 navigasyonunu kullanıyor.
+        if self.mode.upper() == 'AUTO':
+            return
+
+        # GUIDED modda (engel kaçınma aktif) — velocity komutu ilet
         command = TwistStamped()
 
         command.header.stamp = (
@@ -408,6 +483,42 @@ class ControlNode(Node):
 
         self.velocity_publisher.publish(command)
 
+    def manage_mode_switching(self):
+        """Engel durumuna göre AUTO ↔ GUIDED mod geçişini yönetir.
+
+        Kurallar:
+          - obstacle_active = True  → GUIDED moda geç (hemen)
+          - obstacle_active = False → AUTO moda dön (cooldown sonrası)
+          - Cooldown süresi: mode_switch_cooldown_sec
+          - Manuel mod değişikliklerini engelleme
+        """
+        now = time.monotonic()
+        current_mode = self.mode.upper()
+
+        if self.obstacle_active:
+            # Engel var → GUIDED moda geç (acil, cooldown yok)
+            if current_mode != 'GUIDED':
+                self.desired_mode = 'GUIDED'
+                self.request_mode('GUIDED')
+                self.last_mode_switch_time = now
+                self.get_logger().warn(
+                    '[MOD GEÇİŞ] AUTO → GUIDED '
+                    '(engel kaçınma aktif)'
+                )
+        else:
+            # Engel yok → AUTO moda geri dön (cooldown ile)
+            if current_mode == 'GUIDED' and self.desired_mode != 'GUIDED':
+                time_since_switch = now - self.last_mode_switch_time
+
+                if time_since_switch >= self.mode_switch_cooldown:
+                    self.desired_mode = 'AUTO'
+                    self.request_mode('AUTO')
+                    self.last_mode_switch_time = now
+                    self.get_logger().info(
+                        '[MOD GEÇİŞ] GUIDED → AUTO '
+                        '(engel aşıldı, normal seyir)'
+                    )
+
     def control_allowed(self):
         if self.emergency_stop:
             return False
@@ -421,11 +532,13 @@ class ControlNode(Node):
         ):
             return False
 
-        if not self.is_fresh(
-            self.last_command_time,
-            self.command_timeout
-        ):
-            return False
+        # AUTO modda cmd_vel gerekmez — command timeout kontrolünü atla
+        if self.mode.upper() != 'AUTO':
+            if not self.is_fresh(
+                self.last_command_time,
+                self.command_timeout
+            ):
+                return False
 
         if self.require_gps and not self.gps_is_ok():
             return False
@@ -565,6 +678,8 @@ class ControlNode(Node):
             'armed': self.armed,
             'mode': self.mode,
             'emergency_stop': self.emergency_stop,
+            'obstacle_active': self.obstacle_active,
+            'desired_mode': self.desired_mode,
 
             'state_ok': self.is_fresh(
                 self.last_state_time,

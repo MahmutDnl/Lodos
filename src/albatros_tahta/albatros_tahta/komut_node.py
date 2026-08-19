@@ -56,6 +56,7 @@ COSTMAP_GRID_TOPIC   = '/albatros/costmap/grid'
 COSTMAP_VALID_TOPIC  = '/albatros/costmap/valid'
 CMD_VEL_TOPIC        = '/albatros/command/cmd_vel'
 KOMUT_STATUS_TOPIC   = '/albatros/komut/status'
+OBSTACLE_DETECTED_TOPIC = '/albatros/obstacle/detected'
 
 # Varsayılan parametreler
 DEFAULT_PUBLISH_RATE       = 10.0   # Hz
@@ -131,6 +132,10 @@ class KomutNode(Node):
         self.declare_parameter('cost_previous_weight',       DEFAULT_COST_PREVIOUS_WEIGHT)
         self.declare_parameter('cost_clearance_weight',      DEFAULT_COST_CLEARANCE_WEIGHT)
 
+        # Engel tespit parametreleri (hibrit AUTO/GUIDED mod geçişi için)
+        self.declare_parameter('obstacle_detection_enabled',  True)
+        self.declare_parameter('obstacle_forward_cone_deg',   30.0)   # ±15° ön koni
+
         # Parametre okuma
         self._publish_rate    = float(self.get_parameter('publish_rate').value)
         self._max_linear      = float(self.get_parameter('max_linear_speed').value)
@@ -156,6 +161,10 @@ class KomutNode(Node):
         self._weight_previous   = float(self.get_parameter('cost_previous_weight').value)
         self._weight_clearance  = float(self.get_parameter('cost_clearance_weight').value)
 
+        # Engel tespit parametreleri
+        self._obstacle_detection_enabled = bool(self.get_parameter('obstacle_detection_enabled').value)
+        self._obstacle_cone_deg = float(self.get_parameter('obstacle_forward_cone_deg').value)
+
         self._sector_width = 360.0 / self._sector_count
 
         # ─── VehicleState Durumu ─────────────────────────────────────────
@@ -179,6 +188,9 @@ class KomutNode(Node):
         self._total_commands = 0
         self._total_stops    = 0
         self._last_status_time = 0.0
+
+        # ─── Engel Tespit Durumu ─────────────────────────────────────
+        self._obstacle_detected = False
 
         # ─── QoS ────────────────────────────────────────────────────────
         default_qos = QoSProfile(depth=10)
@@ -206,6 +218,10 @@ class KomutNode(Node):
 
         self._pub_status = self.create_publisher(
             String, KOMUT_STATUS_TOPIC, default_qos,
+        )
+
+        self._pub_obstacle = self.create_publisher(
+            Bool, OBSTACLE_DETECTED_TOPIC, default_qos,
         )
 
         # ─── Timer ──────────────────────────────────────────────────────
@@ -258,31 +274,55 @@ class KomutNode(Node):
 
         Akış:
           1. Güvenlik ve veri kontrolleri
-          2. Görev tamamlanma kontrolü
-          3. Parkur tespiti (QGC / mission_node kaynaklı)
-          4. P1 veya P2 navigasyon → Hız komutu
+          2. Engel tespit kontrolü → /albatros/obstacle/detected yayınla
+          3. AUTO modda → sadece izle, cmd_vel üretme
+          4. GUIDED modda → P1 veya P2 navigasyon → Hız komutu
         """
 
         # ── Adım 1: Güvenlik kontrolü ───────────────────────────────────
         safe, reason = self._check_safety()
         if not safe:
             self._publish_stop()
+            self._publish_obstacle(False)
             self._publish_status(active=False, reason=reason)
             return
 
         # ── Adım 2: Görev durumu kontrolü ───────────────────────────────
         if self._state.mission_completed:
             self._publish_stop()
+            self._publish_obstacle(False)
             self._publish_status(active=False, reason='GOREV_TAMAMLANDI')
             return
 
         # mission_node tarafından bir hedef belirtilmiş mi?
         if not self._state.target_valid:
             self._publish_stop()
+            self._publish_obstacle(False)
             self._publish_status(active=False, reason='GECERLI_HEDEF_BEKLENIYOR')
             return
 
-        # ── Adım 3: Parkur tespiti ve navigasyon ────────────────────────
+        # ── Adım 3: Engel tespit kontrolü (her modda çalışır) ───────
+        if self._obstacle_detection_enabled:
+            obstacle_ahead = self._check_obstacle_ahead()
+            self._publish_obstacle(obstacle_ahead)
+        else:
+            self._publish_obstacle(False)
+
+        # ── Adım 4: Mod kontrolü — AUTO'dayken cmd_vel üretme ─────
+        current_mode = self._state.mode.upper() if hasattr(self._state, 'mode') else 'UNKNOWN'
+
+        if current_mode == 'AUTO':
+            # AUTO modda Pixhawk kendi navigasyonunu yapıyor.
+            # Sadece engel izleme aktif, motor komutu üretilmez.
+            self._publish_status(
+                active=False,
+                reason='AUTO_MOD_IZLEME',
+                linear=0.0,
+                angular=0.0,
+            )
+            return
+
+        # ── Adım 5: GUIDED modda → Parkur tespiti ve navigasyon ────
         current_parkur = self._state.current_parkur
 
         if current_parkur == 1:
@@ -290,7 +330,7 @@ class KomutNode(Node):
         else:
             cmd = self._navigate_parkur2()
 
-        # ── Adım 4: Hız komutu yayınlama ────────────────────────────────
+        # ── Adım 6: Hız komutu yayınlama ────────────────────────────────
         if cmd is not None:
             self._pub_cmd_vel.publish(cmd)
             self._total_commands += 1
@@ -441,6 +481,43 @@ class KomutNode(Node):
             return False
         age = (self.get_clock().now() - self._last_costmap_time).nanoseconds / 1e9
         return age < self._costmap_timeout
+
+    def _check_obstacle_ahead(self) -> bool:
+        """Costmap'te aracın önünde tehlikeli engel var mı kontrol eder.
+
+        VFH polar histogramını kullanarak ön koni (obstacle_forward_cone_deg)
+        içinde engel yoğunluğu eşiği aşılmışsa True döner.
+
+        Bu sinyal kontrol_node'un AUTO→GUIDED mod geçişini tetiklemesi
+        için kullanılır. AUTO modda bile sürekli çalışır.
+
+        Returns:
+            True: Önde engel var, GUIDED moda geçilmeli.
+            False: Yol temiz, AUTO modda devam edilebilir.
+        """
+        if not self._has_valid_costmap():
+            return False
+
+        histogram, min_dist = self._build_polar_histogram()
+
+        # Ön koni sektörlerini kontrol et
+        cone_half_sectors = max(1, int(self._obstacle_cone_deg / (2.0 * self._sector_width)))
+
+        for offset in range(-cone_half_sectors, cone_half_sectors + 1):
+            sector = offset % self._sector_count
+
+            if histogram[sector] >= self._vfh_threshold:
+                # Bu sektörde engel yoğunluğu eşiği aşıldı
+                obs_dist = min_dist[sector]
+                if obs_dist < self._active_radius:
+                    self.get_logger().debug(
+                        f'Engel tespit: sektör={sector}, '
+                        f'yoğunluk={histogram[sector]:.2f}, '
+                        f'mesafe={obs_dist:.1f}m'
+                    )
+                    return True
+
+        return False
 
     # ═════════════════════════════════════════════════════════════════════
     # VFH Algoritması
@@ -701,7 +778,7 @@ class KomutNode(Node):
         if not state.armed:
             return False, 'ARM_DEGIL'
 
-        if state.mode.upper() != 'GUIDED':
+        if state.mode.upper() not in ('GUIDED', 'AUTO'):
             return False, f'MOD_YANLIS ({state.mode})'
 
         if not state.gps_ok:
@@ -728,6 +805,13 @@ class KomutNode(Node):
         self._pub_cmd_vel.publish(Twist())
         self._total_stops += 1
 
+    def _publish_obstacle(self, detected: bool):
+        """Engel tespit durumunu /albatros/obstacle/detected topic'ine yayınlar."""
+        self._obstacle_detected = detected
+        msg = Bool()
+        msg.data = detected
+        self._pub_obstacle.publish(msg)
+
     def _publish_status(self, active, reason, linear=0.0, angular=0.0):
         """JSON formatında durum bilgisi yayınlar (throttled: 2 Hz)."""
         now = time.time()
@@ -743,6 +827,8 @@ class KomutNode(Node):
             'heading_error_deg':   round(self._state.heading_error_deg, 1) if self._state else 0.0,
             'linear_speed':        round(linear, 3),
             'angular_speed':       round(angular, 3),
+            'obstacle_detected':   self._obstacle_detected,
+            'current_mode':        self._state.mode if self._state and hasattr(self._state, 'mode') else 'UNKNOWN',
             'total_commands':      self._total_commands,
             'total_stops':         self._total_stops,
         }

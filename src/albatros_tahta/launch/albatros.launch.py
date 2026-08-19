@@ -256,6 +256,9 @@ def generate_launch_description():
             'cost_current_weight': 2.0,
             'cost_previous_weight': 2.0,
             'cost_clearance_weight': 3.0,
+            # Engel tespit (hibrit AUTO/GUIDED)
+            'obstacle_detection_enabled': True,
+            'obstacle_forward_cone_deg': 30.0,
         }],
     )
 
@@ -272,6 +275,10 @@ def generate_launch_description():
             'max_angular_speed': 3.0,
             'require_gps': True,
             'require_imu': True,
+            # Hibrit AUTO/GUIDED mod geçiş parametreleri
+            'default_mode': 'AUTO',
+            'mode_switch_cooldown_sec': 2.0,
+            'auto_mode_obstacle_switching': True,
         }],
     )
 

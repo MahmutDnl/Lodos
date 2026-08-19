@@ -37,6 +37,7 @@ bool mavros_connected
 bool armed
 string mode
 bool emergency_stop
+bool obstacle_active
 
 bool gps_ok
 bool imu_ok

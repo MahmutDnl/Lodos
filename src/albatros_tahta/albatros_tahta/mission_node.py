@@ -387,6 +387,10 @@ class MissionNode(Node):
                     self.active_waypoint['longitude']
                 )
 
+                # NOT: AUTO modda waypoint varışı Pixhawk'ın WaypointReached
+                # mesajıyla (waypoint_reached_callback) belirlenir.
+                # GPS tabanlı check_gps_reached ek güvenlik olarak korunur
+                # ama asıl tetikleyici WaypointReached callback'idir.
                 self.check_gps_reached()
 
         self.current_parkur = self.determine_current_parkur()

@@ -88,6 +88,7 @@ class StateNode(Node):
         self._gps_ok           = False
         self._imu_ok           = False
         self._control_allowed  = False
+        self._obstacle_active  = False
 
         # ─── Timestamp takibi (timeout kontrolü) ─────────────────────────────
         self._last_mission_time = None
@@ -321,6 +322,7 @@ class StateNode(Node):
             self._gps_ok           = bool(data.get('gps_ok',           False))
             self._imu_ok           = bool(data.get('imu_ok',           False))
             self._control_allowed  = bool(data.get('control_allowed',  False))
+            self._obstacle_active  = bool(data.get('obstacle_active',  False))
 
         except (json.JSONDecodeError, TypeError, ValueError) as e:
             self.get_logger().warn(
@@ -335,6 +337,7 @@ class StateNode(Node):
             self._gps_ok           = False
             self._imu_ok           = False
             self._control_allowed  = False
+            self._obstacle_active  = False
 
     def is_fresh(self, last_time, timeout: float) -> bool:
         """
@@ -457,6 +460,7 @@ class StateNode(Node):
         msg.armed            = self._armed
         msg.mode             = self._mode
         msg.emergency_stop   = self._emergency_stop
+        msg.obstacle_active  = self._obstacle_active
         msg.gps_ok           = self._gps_ok
         msg.imu_ok           = self._imu_ok
         msg.control_allowed  = self._control_allowed
