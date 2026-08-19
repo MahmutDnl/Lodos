@@ -238,9 +238,12 @@ def generate_launch_description():
             'max_linear_speed': 2.5,
             'min_linear_speed': 0.8,
             'max_angular_speed': 3.0,
-            'steering_kp': 2.5,
+            'steering_kp': 1.5,             # 2.5'ten düşürüldü — osilasyon önleme
             'slowdown_distance_m': 4.0,
             'state_timeout_sec': 2.0,
+            # Heading filtre (osilasyon önleme)
+            'heading_deadband_deg': 5.0,    # ±5° altındaki hataları yoksay
+            'heading_filter_alpha': 0.3,    # EMA yumuşatma (0=çok pürüzsüz, 1=filtre yok)
             # VFH parametreleri (Parkur 2)
             'sector_count': 72,
             'vfh_threshold': 0.35,

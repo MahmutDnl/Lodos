@@ -114,6 +114,10 @@ class KomutNode(Node):
         self.declare_parameter('slowdown_distance_m',   DEFAULT_SLOWDOWN_DISTANCE)
         self.declare_parameter('state_timeout_sec',     DEFAULT_STATE_TIMEOUT)
 
+        # Heading filtre parametreleri (osilasyon önleme)
+        self.declare_parameter('heading_deadband_deg',  5.0)   # ±5° altındaki hataları yoksay
+        self.declare_parameter('heading_filter_alpha',  0.3)   # EMA yumuşatma (0-1, düşük=daha pürüzsüz)
+
         # VFH parametreleri
         self.declare_parameter('sector_count',               DEFAULT_SECTOR_COUNT)
         self.declare_parameter('vfh_threshold',              DEFAULT_VFH_THRESHOLD)
@@ -135,6 +139,10 @@ class KomutNode(Node):
         self._steering_kp     = float(self.get_parameter('steering_kp').value)
         self._slowdown_dist   = float(self.get_parameter('slowdown_distance_m').value)
         self._state_timeout   = float(self.get_parameter('state_timeout_sec').value)
+
+        # Heading filtre parametreleri
+        self._heading_deadband = float(self.get_parameter('heading_deadband_deg').value)
+        self._heading_alpha    = float(self.get_parameter('heading_filter_alpha').value)
 
         self._sector_count      = int(self.get_parameter('sector_count').value)
         self._vfh_threshold     = float(self.get_parameter('vfh_threshold').value)
@@ -161,6 +169,11 @@ class KomutNode(Node):
 
         # ─── VFH Durumu ──────────────────────────────────────────────────
         self._prev_selected_sector = 0
+
+        # ─── Heading Error Filtre Durumu ─────────────────────────────────
+        # EMA (Exponential Moving Average) ile IMU gürültüsünü yumuşatır
+        self._filtered_heading_error = 0.0
+        self._filtered_vfh_angle = 0.0
 
         # ─── İstatistikler ───────────────────────────────────────────────
         self._total_commands = 0
@@ -299,16 +312,36 @@ class KomutNode(Node):
 
         Dönüş: state_node'dan gelen heading_error'a orantılı angular.z
         İleri: hedefe uzaklığa ve dönüş açısına göre linear.x
+
+        NOT: heading_error_deg pozitif = hedef sağda (CW dönüş gerekli)
+             ArduRover body-frame: angular.z pozitif = CCW (sola dönüş)
+             Bu yüzden işaret ters çevriliyor.
+
+        Osilasyon önleme:
+          1. Deadband: ±heading_deadband_deg içindeki hatalar yoksayılır
+          2. EMA filtre: IMU gürültüsü yumuşatılır
         """
         cmd = Twist()
         dist = self._state.distance_to_target_m
         err_deg = self._state.heading_error_deg
 
+        # ── Deadband: küçük heading hatalarını yoksay ─────────────────
+        if abs(err_deg) < self._heading_deadband:
+            err_deg = 0.0
+
+        # ── EMA filtre: IMU gürültüsünü yumuşat ──────────────────────
+        self._filtered_heading_error = (
+            self._heading_alpha * err_deg
+            + (1.0 - self._heading_alpha) * self._filtered_heading_error
+        )
+        err_deg = self._filtered_heading_error
+
         # ── Dönüş komutu (P kontrolcüsü) ─────────────────────────────
+        # heading_error pozitif → hedef sağda → CW dönüş → angular.z negatif
         err_rad = math.radians(err_deg)
         angular_z = self._steering_kp * err_rad
         angular_z = clamp(angular_z, -self._max_angular, self._max_angular)
-        cmd.angular.z = angular_z
+        cmd.angular.z = -angular_z  # İşaret ters: heading_error → ArduRover konvansiyonu
 
         # ── İleri hız ─────────────────────────────────────────────────
         # Hedefe yaklaştıkça yavaşla
@@ -581,12 +614,32 @@ class KomutNode(Node):
     def _calculate_vfh_speeds(self, selected_angle_deg, nearest_obs_dist):
         """
         VFH tarafından seçilen yöne göre hız ve dönüş komutu hesaplar.
+
+        NOT: angular işareti ters çevriliyor — heading_error konvansiyonu
+             ile ArduRover body-frame konvansiyonu arasındaki fark için.
+
+        Osilasyon önleme:
+          1. Deadband: küçük açı hataları yoksayılır
+          2. EMA filtre: VFH seçim gürültüsü yumuşatılır
         """
         angle_error_deg = normalize_angle_180(selected_angle_deg)
+
+        # ── Deadband: küçük açı hatalarını yoksay ─────────────────────
+        if abs(angle_error_deg) < self._heading_deadband:
+            angle_error_deg = 0.0
+
+        # ── EMA filtre: VFH seçim gürültüsünü yumuşat ────────────────
+        self._filtered_vfh_angle = (
+            self._heading_alpha * angle_error_deg
+            + (1.0 - self._heading_alpha) * self._filtered_vfh_angle
+        )
+        angle_error_deg = self._filtered_vfh_angle
+
         angle_error_rad = math.radians(angle_error_deg)
 
         angular = self._steering_kp * angle_error_rad
         angular = clamp(angular, -self._max_angular, self._max_angular)
+        angular = -angular  # İşaret ters: heading_error → ArduRover konvansiyonu
 
         if nearest_obs_dist <= 0.01:
             dist_factor = 0.0
