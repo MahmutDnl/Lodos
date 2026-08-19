@@ -8,13 +8,18 @@ Görev:
   - Parkur 3 (Kamikaze Angajman) için YOLO tespitleri (conf >= 0.30) ile OpenCV HSV
     renk analizini ROI düzeyinde birleştirir.
   - %60 YOLO / %40 OpenCV HSV ağırlıklı skor hesabı yapar (Final Eşik: 0.65).
-  - İHA / YKİ hedef rengi ile YOLO renk sınıfını normalize ederek karşılaştırır (TR/EN destekli).
-  - 5 frame temporal doğrulama (tam dolu 5 frame, en az 4/5 uyum) ve bbox fiziksel süreklilik takibi uygular.
+  - Hedef renk bilgisi doğrudan İDA Pixhawk'ındaki `SCR_USER1` parametresinden pymavlink ile çekilir.
+    Merkezi renk eşleşmesi:
+      1 -> RED
+      2 -> GREEN
+      3 -> BLACK
+      Diğer -> UNKNOWN
+  - Kesintisiz 5 saniye zaman tabanlı doğrulama uygular (time.monotonic kullanır).
   - Kamera framelerini timestamp ile deque(maxlen=10) içinde tutar ve YOLO timestamp ile senkronize eder.
   - Hedef onaylandığında `target_confirmed = true` ve hedef açısı (`target_angle_deg`) yayınlar.
 
 Kısıtlar:
-  - Motor veya Pixhawk komutu ÜRETMEZ.
+  - Motor veya Pixhawk sürüş komutu ÜRETMEZ.
   - Tarama hareketi YAPTIRMAZ.
   - YOLO modeli YÜKLEMEZ.
   - Sadece perception & validation katmanıdır.
@@ -23,6 +28,8 @@ Kısıtlar:
 from collections import deque
 import json
 import math
+import threading
+import time
 import numpy as np
 import cv2
 
@@ -33,10 +40,22 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
 try:
+    from pymavlink import mavutil
+except ImportError:
+    mavutil = None
+
+try:
     from albatros_interfaces.msg import MissionStatus, VehicleState
 except ImportError:
     MissionStatus = None
     VehicleState = None
+
+# ─── Merkezi Renk Sözlüğü ─────────────────────────────────────────────────────
+TARGET_COLOR_MAP = {
+    1: "RED",
+    2: "GREEN",
+    3: "BLACK",
+}
 
 
 def normalize_color_name(name: str) -> str:
@@ -48,9 +67,8 @@ def normalize_color_name(name: str) -> str:
         return "UNKNOWN"
 
     s = name.strip().lower()
-    # Normalize Turkish specific characters safely
     s = s.replace('ı', 'i').replace('ş', 's').replace('ğ', 'g').replace('ü', 'u').replace('ö', 'o').replace('ç', 'c')
-    s = s.replace('\u0307', '')  # Remove combining dot above if present from Turkish İ lowercasing
+    s = s.replace('\u0307', '')
     s = s.replace('_', ' ').replace('-', ' ')
 
     if 'kirmizi' in s or 'red' in s:
@@ -65,7 +83,8 @@ def normalize_color_name(name: str) -> str:
 class Parkur3TargetNode(Node):
     """
     Parkur 3 Target Validation Node for LODOS Albatros İDA.
-    Fuses YOLO detections with OpenCV HSV ROI color validation and 5-frame temporal history.
+    Fuses YOLO detections with OpenCV HSV ROI color validation and 5.0-second continuous time validation.
+    Reads target color from Pixhawk SCR_USER1 parameter via pymavlink.
     """
 
     def __init__(self):
@@ -74,10 +93,13 @@ class Parkur3TargetNode(Node):
         # ─── ROS Parameters ───────────────────────────────────────────────────
         self.declare_parameter('input_image_topic', '/albatros/kamera/image_raw')
         self.declare_parameter('yolo_detections_topic', '/albatros/yolo/tespitler')
-        self.declare_parameter('target_color_topic', '/albatros/hedef_renk')
         self.declare_parameter('vehicle_state_topic', '/albatros/state')
         self.declare_parameter('mission_status_topic', '/albatros/mission/status')
         self.declare_parameter('output_target_topic', '/albatros/parkur3/target_confirmed')
+
+        # MAVLink Connection Parameters
+        self.declare_parameter('mavlink_device', '/dev/ttyACM0')
+        self.declare_parameter('mavlink_baud', 115200)
 
         # Weights & Thresholds (%60 YOLO, %40 OpenCV)
         self.declare_parameter('yolo_weight', 0.60)
@@ -86,43 +108,40 @@ class Parkur3TargetNode(Node):
         self.declare_parameter('yolo_min_confidence', 0.30)
         self.declare_parameter('opencv_color_gate', 0.15)  # Min color ratio inside ROI
 
-        # Temporal validation parameters
-        self.declare_parameter('validation_window_size', 5)
-        self.declare_parameter('required_confirmations', 4)
+        # Continuous Time Validation parameters
+        self.declare_parameter('required_validation_sec', 5.0)
         self.declare_parameter('bbox_center_tolerance_px', 60.0)
 
         # Frame Synchronization & Turning parameters
         self.declare_parameter('frame_sync_tolerance_sec', 0.15)
         self.declare_parameter('clear_history_while_turning', False)
 
-        # Camera parameters (Logitech C920 default FOV ~78 degrees, optional fx focal length in pixels)
+        # Camera parameters
         self.declare_parameter('camera_fov_deg', 78.0)
         self.declare_parameter('camera_width_px', 640)
         self.declare_parameter('camera_fx_px', 0.0)
 
         # HSV Range Parameters
-        # Red range 1
         self.declare_parameter('hsv_red_low1', [0, 100, 80])
         self.declare_parameter('hsv_red_high1', [10, 255, 255])
-        # Red range 2 (wrap-around)
         self.declare_parameter('hsv_red_low2', [160, 100, 80])
         self.declare_parameter('hsv_red_high2', [180, 255, 255])
 
-        # Green range
         self.declare_parameter('hsv_green_low', [35, 70, 70])
         self.declare_parameter('hsv_green_high', [85, 255, 255])
 
-        # Black range
         self.declare_parameter('hsv_black_low', [0, 0, 0])
         self.declare_parameter('hsv_black_high', [180, 255, 70])
 
-        # Read parameters
+        # Read parameter values
         self.input_image_topic = str(self.get_parameter('input_image_topic').value)
         self.yolo_detections_topic = str(self.get_parameter('yolo_detections_topic').value)
-        self.target_color_topic = str(self.get_parameter('target_color_topic').value)
         self.vehicle_state_topic = str(self.get_parameter('vehicle_state_topic').value)
         self.mission_status_topic = str(self.get_parameter('mission_status_topic').value)
         self.output_target_topic = str(self.get_parameter('output_target_topic').value)
+
+        self.mavlink_device = str(self.get_parameter('mavlink_device').value)
+        self.mavlink_baud = int(self.get_parameter('mavlink_baud').value)
 
         self.yolo_weight = float(self.get_parameter('yolo_weight').value)
         self.opencv_weight = float(self.get_parameter('opencv_weight').value)
@@ -130,8 +149,7 @@ class Parkur3TargetNode(Node):
         self.yolo_min_confidence = float(self.get_parameter('yolo_min_confidence').value)
         self.opencv_color_gate = float(self.get_parameter('opencv_color_gate').value)
 
-        self.window_size = int(self.get_parameter('validation_window_size').value)
-        self.required_confirmations = int(self.get_parameter('required_confirmations').value)
+        self.required_validation_sec = float(self.get_parameter('required_validation_sec').value)
         self.bbox_tolerance = float(self.get_parameter('bbox_center_tolerance_px').value)
 
         self.frame_sync_tolerance_sec = float(self.get_parameter('frame_sync_tolerance_sec').value)
@@ -141,7 +159,7 @@ class Parkur3TargetNode(Node):
         self.camera_width_px = int(self.get_parameter('camera_width_px').value)
         self.camera_fx_px = float(self.get_parameter('camera_fx_px').value)
 
-        # Parameter Validation & Normalization
+        # Normalize weights if needed
         total_weight = self.yolo_weight + self.opencv_weight
         if abs(total_weight - 1.0) > 1e-3:
             self.get_logger().warn(
@@ -155,23 +173,22 @@ class Parkur3TargetNode(Node):
                 self.yolo_weight = 0.60
                 self.opencv_weight = 0.40
 
-        if self.required_confirmations > self.window_size:
-            self.get_logger().warn(
-                f"required_confirmations ({self.required_confirmations}) > window_size ({self.window_size}). "
-                f"Clamping required_confirmations to window_size."
-            )
-            self.required_confirmations = self.window_size
-
         # ─── Dahili Durum Değişkenleri ───────────────────────────────────────
         self.image_buffer = deque(maxlen=10)
         self.current_parkur = 0
         self.is_parkur3 = False
         self.has_mission_status = False
         self.vehicle_turning = False
-        self.target_color = "UNKNOWN"  # Default target color until updated by drone/GCS
 
-        # Temporal validation sliding window
-        self.history = deque(maxlen=self.window_size)
+        self.state_lock = threading.Lock()
+        self.target_color = "UNKNOWN"
+        self.last_scr_user1_val = None
+
+        # Continuous time validation state
+        self.validation_start_time = None
+        self.last_target_center = None
+        self.last_progress_log_time = 0.0
+        self.confirmed_logged = False
 
         # ─── Publishers & Subscribers ────────────────────────────────────────
         self.pub_confirmed_target = self.create_publisher(String, self.output_target_topic, 10)
@@ -187,13 +204,6 @@ class Parkur3TargetNode(Node):
             String,
             self.yolo_detections_topic,
             self.cb_yolo_detections,
-            10
-        )
-
-        self.sub_target_color = self.create_subscription(
-            String,
-            self.target_color_topic,
-            self.cb_target_color,
             10
         )
 
@@ -213,13 +223,147 @@ class Parkur3TargetNode(Node):
                 10
             )
 
+        # ─── MAVLink Background Thread Start ─────────────────────────────────
+        self.mavlink_thread_running = True
+        self.mavlink_thread = threading.Thread(target=self._mavlink_worker, daemon=True)
+        self.mavlink_thread.start()
+
         self.get_logger().info(
             f"Parkur3TargetNode initialized. Target color: '{self.target_color}', "
+            f"MAVLink device: '{self.mavlink_device}' @ {self.mavlink_baud} baud, "
             f"Weights: YOLO={self.yolo_weight:.2f} / OpenCV={self.opencv_weight:.2f}, "
             f"Final Threshold={self.final_score_threshold:.2f}, "
-            f"Frame Sync Tolerance={self.frame_sync_tolerance_sec:.2f}s, "
-            f"Camera fx={self.camera_fx_px:.1f}px"
+            f"Required continuous validation time={self.required_validation_sec:.1f}s"
         )
+
+    def destroy_node(self):
+        self.mavlink_thread_running = False
+        super().destroy_node()
+
+    def reset_validation(self):
+        """Resets time-based continuous validation state."""
+        self.validation_start_time = None
+        self.last_target_center = None
+        self.confirmed_logged = False
+
+    # =========================================================================
+    # MAVLink SCR_USER1 Reader
+    # =========================================================================
+
+    def _mavlink_worker(self):
+        """
+        Background thread polling Pixhawk's SCR_USER1 parameter ~0.5s via pymavlink.
+        Does NOT block main ROS callbacks. Auto-reconnects if Pixhawk connection drops.
+        """
+        mav_conn = None
+
+        while rclpy.ok() and self.mavlink_thread_running:
+            if mavutil is None:
+                self.get_logger().error(
+                    "pymavlink library is not installed! Unable to read Pixhawk SCR_USER1 parameter.",
+                    throttle_duration_sec=10.0
+                )
+                self._update_target_color_from_scr(None)
+                time.sleep(2.0)
+                continue
+
+            device = str(self.get_parameter('mavlink_device').value)
+            baud = int(self.get_parameter('mavlink_baud').value)
+
+            # Establish or re-establish MAVLink connection
+            if mav_conn is None:
+                try:
+                    self.get_logger().info(
+                        f"Connecting to Pixhawk MAVLink on {device} @ {baud}...",
+                        throttle_duration_sec=10.0
+                    )
+                    mav_conn = mavutil.mavlink_connection(device, baud=baud, autoreconnect=True)
+                    hb = mav_conn.wait_heartbeat(timeout=3.0)
+                    if hb:
+                        self.get_logger().info(
+                            f"Pixhawk MAVLink Heartbeat received! System ID: {mav_conn.target_system}, Component ID: {mav_conn.target_component}"
+                        )
+                    else:
+                        self.get_logger().warn(
+                            f"No heartbeat from Pixhawk on {device}. Retrying... "
+                            f"(If using {device}, check if MAVROS or another pymavlink process is running)",
+                            throttle_duration_sec=5.0
+                        )
+                        try:
+                            mav_conn.close()
+                        except Exception:
+                            pass
+                        mav_conn = None
+                        self._update_target_color_from_scr(None)
+                        time.sleep(2.0)
+                        continue
+                except Exception as e:
+                    self.get_logger().warn(
+                        f"MAVLink connection error on {device}: {e}. "
+                        f"(If device busy, verify if MAVROS or another process is using {device}). Retrying in 2.0s...",
+                        throttle_duration_sec=5.0
+                    )
+                    mav_conn = None
+                    self._update_target_color_from_scr(None)
+                    time.sleep(2.0)
+                    continue
+
+            # Connected: request SCR_USER1 parameter
+            try:
+                mav_conn.mav.param_request_read_send(
+                    mav_conn.target_system,
+                    mav_conn.target_component,
+                    b'SCR_USER1',
+                    -1
+                )
+
+                msg = mav_conn.recv_match(type='PARAM_VALUE', blocking=True, timeout=0.4)
+                if msg is not None:
+                    param_id = msg.param_id
+                    if isinstance(param_id, bytes):
+                        param_id = param_id.decode('utf-8', errors='ignore')
+                    param_id = param_id.replace('\x00', '').strip()
+
+                    if param_id == 'SCR_USER1':
+                        scr_val = int(round(float(msg.param_value)))
+                        self._update_target_color_from_scr(scr_val)
+                else:
+                    # Request timeout or no match this cycle
+                    pass
+            except Exception as e:
+                self.get_logger().warn(
+                    f"MAVLink error while reading SCR_USER1: {e}. Reconnecting...",
+                    throttle_duration_sec=5.0
+                )
+                try:
+                    mav_conn.close()
+                except Exception:
+                    pass
+                mav_conn = None
+                self._update_target_color_from_scr(None)
+                time.sleep(2.0)
+                continue
+
+            time.sleep(0.5)
+
+    def _update_target_color_from_scr(self, scr_val):
+        """
+        Updates self.target_color based on Pixhawk SCR_USER1 value using TARGET_COLOR_MAP.
+        """
+        with self.state_lock:
+            if scr_val == self.last_scr_user1_val:
+                return
+
+            self.last_scr_user1_val = scr_val
+            new_color = TARGET_COLOR_MAP.get(scr_val, "UNKNOWN")
+
+            log_str = f"[HEDEF RENK] SCR_USER1={scr_val} -> {new_color}"
+            self.get_logger().info(log_str)
+            print(log_str, flush=True)
+
+            if new_color != self.target_color:
+                self.target_color = new_color
+                self.reset_validation()
 
     # =========================================================================
     # Callbacks
@@ -228,7 +372,6 @@ class Parkur3TargetNode(Node):
     def cb_image(self, msg: Image):
         """Stores camera frame with timestamp in deque(maxlen=10)."""
         try:
-            # Extract header timestamp in seconds (float)
             stamp_sec = msg.header.stamp.sec + (msg.header.stamp.nanosec / 1e9)
             if stamp_sec == 0.0:
                 stamp_sec = self.get_clock().now().nanoseconds / 1e9
@@ -252,20 +395,6 @@ class Parkur3TargetNode(Node):
         except Exception as e:
             self.get_logger().error(f"Failed to convert image in target node: {e}", throttle_duration_sec=2.0)
 
-    def cb_target_color(self, msg: String):
-        """Receives target color from Drone / GCS (e.g. 'RED', 'GREEN', 'BLACK', 'KIRMIZI', etc.)."""
-        raw_input = msg.data.strip()
-        norm_color = normalize_color_name(raw_input)
-        if norm_color != "UNKNOWN":
-            if norm_color != self.target_color:
-                self.get_logger().info(f"Target color updated from topic: '{norm_color}' (raw: '{raw_input}')")
-                self.target_color = norm_color
-                self.history.clear()
-        else:
-            self.get_logger().warn(
-                f"Received unknown target color: '{raw_input}'. Keeping current target color '{self.target_color}'."
-            )
-
     def cb_mission_status(self, msg):
         self.has_mission_status = True
         self.current_parkur = msg.current_parkur
@@ -285,20 +414,25 @@ class Parkur3TargetNode(Node):
         """
         Main perception and validation pipeline triggered when YOLO detections arrive.
         Filters candidate detections by requested color, validates ROI via OpenCV HSV,
-        applies weighted scoring, and enforces 5-frame temporal confirmation.
+        applies weighted scoring, and enforces 5.0-second continuous time confirmation.
         """
         now_stamp = self.get_clock().now().nanoseconds / 1e9
 
+        with self.state_lock:
+            start_target_color = self.target_color
+
         # 1. Parkur 3 active state check
         if not self.is_parkur3:
-            self.history.clear()
-            self.publish_result(now_stamp, False, self.target_color, "UNKNOWN", 0.0, 0.0, 0.0, 0, 0, 0.0, {})
+            with self.state_lock:
+                self.reset_validation()
+            self.publish_result(now_stamp, False, start_target_color, "UNKNOWN", 0.0, 0.0, 0.0, 0, 0, 0.0, {}, 0.0)
             return
 
         # 2. Target color set check
-        if self.target_color == "UNKNOWN":
-            self.history.clear()
-            self.publish_result(now_stamp, False, "UNKNOWN", "UNKNOWN", 0.0, 0.0, 0.0, 0, 0, 0.0, {})
+        if start_target_color == "UNKNOWN":
+            with self.state_lock:
+                self.reset_validation()
+            self.publish_result(now_stamp, False, "UNKNOWN", "UNKNOWN", 0.0, 0.0, 0.0, 0, 0, 0.0, {}, 0.0)
             return
 
         # 3. Parse JSON YOLO payload safely
@@ -312,9 +446,9 @@ class Parkur3TargetNode(Node):
                 raw_detections = []
         except Exception as e:
             self.get_logger().debug(f"Failed to parse YOLO detections JSON: {e}")
-            self.history.append(None)
-            match_count = len([obs for obs in self.history if obs is not None])
-            self.publish_result(now_stamp, False, self.target_color, "UNKNOWN", 0.0, 0.0, 0.0, 0, 0, 0.0, {}, match_count)
+            with self.state_lock:
+                self.reset_validation()
+            self.publish_result(now_stamp, False, start_target_color, "UNKNOWN", 0.0, 0.0, 0.0, 0, 0, 0.0, {}, 0.0)
             return
 
         pub_stamp = yolo_stamp if yolo_stamp is not None else now_stamp
@@ -324,9 +458,9 @@ class Parkur3TargetNode(Node):
         if yolo_stamp is not None:
             if len(self.image_buffer) == 0:
                 self.get_logger().warn("Image buffer is empty. Cannot process YOLO detection.", throttle_duration_sec=2.0)
-                self.history.append(None)
-                match_count = len([obs for obs in self.history if obs is not None])
-                self.publish_result(pub_stamp, False, self.target_color, "UNKNOWN", 0.0, 0.0, 0.0, 0, 0, 0.0, {}, match_count)
+                with self.state_lock:
+                    self.reset_validation()
+                self.publish_result(pub_stamp, False, start_target_color, "UNKNOWN", 0.0, 0.0, 0.0, 0, 0, 0.0, {}, 0.0)
                 return
 
             best_match = min(self.image_buffer, key=lambda item: abs(item["stamp"] - yolo_stamp))
@@ -337,9 +471,9 @@ class Parkur3TargetNode(Node):
                     f"YOLO frame sync tolerance exceeded: time_diff={time_diff:.3f}s > threshold={self.frame_sync_tolerance_sec:.3f}s. Detection rejected.",
                     throttle_duration_sec=2.0
                 )
-                self.history.append(None)
-                match_count = len([obs for obs in self.history if obs is not None])
-                self.publish_result(pub_stamp, False, self.target_color, "UNKNOWN", 0.0, 0.0, 0.0, 0, 0, 0.0, {}, match_count)
+                with self.state_lock:
+                    self.reset_validation()
+                self.publish_result(pub_stamp, False, start_target_color, "UNKNOWN", 0.0, 0.0, 0.0, 0, 0, 0.0, {}, 0.0)
                 return
 
             current_frame = best_match["frame"]
@@ -347,9 +481,9 @@ class Parkur3TargetNode(Node):
         else:
             self.get_logger().warn("YOLO JSON missing 'stamp'. Falling back to latest camera frame.", throttle_duration_sec=5.0)
             if len(self.image_buffer) == 0:
-                self.history.append(None)
-                match_count = len([obs for obs in self.history if obs is not None])
-                self.publish_result(pub_stamp, False, self.target_color, "UNKNOWN", 0.0, 0.0, 0.0, 0, 0, 0.0, {}, match_count)
+                with self.state_lock:
+                    self.reset_validation()
+                self.publish_result(pub_stamp, False, start_target_color, "UNKNOWN", 0.0, 0.0, 0.0, 0, 0, 0.0, {}, 0.0)
                 return
 
             latest_item = self.image_buffer[-1]
@@ -357,9 +491,9 @@ class Parkur3TargetNode(Node):
             self.camera_width_px = latest_item["width"]
 
         if current_frame is None:
-            self.history.append(None)
-            match_count = len([obs for obs in self.history if obs is not None])
-            self.publish_result(pub_stamp, False, self.target_color, "UNKNOWN", 0.0, 0.0, 0.0, 0, 0, 0.0, {}, match_count)
+            with self.state_lock:
+                self.reset_validation()
+            self.publish_result(pub_stamp, False, start_target_color, "UNKNOWN", 0.0, 0.0, 0.0, 0, 0, 0.0, {}, 0.0)
             return
 
         # 5. Filter & Evaluate Candidate Detections
@@ -380,7 +514,7 @@ class Parkur3TargetNode(Node):
             # Class name normalization & requested color match
             class_name_raw = det.get("class_name", "")
             detected_color = normalize_color_name(str(class_name_raw))
-            if detected_color == "UNKNOWN" or detected_color != self.target_color:
+            if detected_color == "UNKNOWN" or detected_color != start_target_color:
                 continue
 
             # BBox validation
@@ -415,7 +549,7 @@ class Parkur3TargetNode(Node):
                     center = {"x": cx, "y": cy}
 
             # OpenCV ROI HSV color verification
-            opencv_conf, color_pass = self.evaluate_roi_color(current_frame, bbox, self.target_color)
+            opencv_conf, color_pass = self.evaluate_roi_color(current_frame, bbox, start_target_color)
 
             if not color_pass:
                 self.get_logger().debug(
@@ -443,65 +577,74 @@ class Parkur3TargetNode(Node):
             candidates.sort(key=lambda c: c["final_score"], reverse=True)
             best_candidate = candidates[0]
 
-        # 7. Check Vehicle Turning State
-        if self.vehicle_turning and self.clear_history_while_turning:
-            self.history.clear()
-            self.publish_result(pub_stamp, False, self.target_color, "UNKNOWN", 0.0, 0.0, 0.0, 0, 0, 0.0, {})
-            return
+        now_mono = time.monotonic()
 
-        # 8. Physical Spatial Continuity Check & History Update
-        if best_candidate is not None:
-            last_valid_obs = None
-            for obs in reversed(self.history):
-                if obs is not None:
-                    last_valid_obs = obs
-                    break
+        # 7. Check race condition: Verify SCR_USER1 target_color didn't change while processing frame
+        with self.state_lock:
+            if self.target_color != start_target_color or self.target_color == "UNKNOWN":
+                # Target color changed mid-frame! Cancel frame and reset validation.
+                self.reset_validation()
+                self.publish_result(pub_stamp, False, self.target_color, "UNKNOWN", 0.0, 0.0, 0.0, 0, 0, 0.0, {}, 0.0)
+                return
 
-            if last_valid_obs is not None:
-                last_cx = last_valid_obs["center"]["x"]
-                last_cy = last_valid_obs["center"]["y"]
-                curr_cx = best_candidate["center"]["x"]
-                curr_cy = best_candidate["center"]["y"]
-                dist = math.hypot(curr_cx - last_cx, curr_cy - last_cy)
+            if self.vehicle_turning and self.clear_history_while_turning:
+                self.reset_validation()
+                self.publish_result(pub_stamp, False, start_target_color, "UNKNOWN", 0.0, 0.0, 0.0, 0, 0, 0.0, {}, 0.0)
+                return
+
+            if best_candidate is None:
+                # Target lost in this frame -> reset continuous timer
+                self.reset_validation()
+                self.publish_result(pub_stamp, False, start_target_color, "UNKNOWN", 0.0, 0.0, 0.0, 0, 0, 0.0, {}, 0.0)
+                return
+
+            # Check spatial center jump tolerance
+            if self.last_target_center is not None:
+                dist = math.hypot(
+                    best_candidate["center"]["x"] - self.last_target_center["x"],
+                    best_candidate["center"]["y"] - self.last_target_center["y"]
+                )
                 if dist > self.bbox_tolerance:
-                    # Spatial shift too large -> reset history for new physical target track
-                    self.history.clear()
+                    # Spatial shift too large -> reset timer for new physical target track
+                    self.reset_validation()
 
-            self.history.append(best_candidate)
-        else:
-            self.history.append(None)
+            self.last_target_center = best_candidate["center"]
 
-        # 9. Evaluate 5-Frame Temporal Confirmation (Requires 5 full frames and >= 4 valid observations)
-        valid_observations = [obs for obs in self.history if obs is not None]
-        match_count = len(valid_observations)
+            if self.validation_start_time is None:
+                self.validation_start_time = now_mono
 
-        if len(self.history) == self.window_size and match_count >= self.required_confirmations and best_candidate is not None:
-            target_confirmed = True
-            final_score = best_candidate["final_score"]
-            yolo_conf = best_candidate["yolo_conf"]
-            opencv_conf = best_candidate["opencv_conf"]
-            cx = best_candidate["center"]["x"]
-            cy = best_candidate["center"]["y"]
-            bbox = best_candidate["bbox"]
-            detected_color = best_candidate["detected_color"]
+            elapsed_sec = now_mono - self.validation_start_time
+            confirmed = (elapsed_sec >= self.required_validation_sec)
 
-            # Compute horizontal angle relative to camera optical axis
-            target_angle_deg = self.calculate_target_angle(cx)
+            # Logging logic
+            if confirmed:
+                if not self.confirmed_logged:
+                    log_msg = f"[TARGET CONFIRMED] {start_target_color} | 5 saniye doğrulandı"
+                    self.get_logger().info(log_msg)
+                    print(log_msg, flush=True)
+                    self.confirmed_logged = True
+            else:
+                self.confirmed_logged = False
+                if now_mono - self.last_progress_log_time >= 1.0:
+                    log_msg = f"[DOĞRULANIYOR] {start_target_color} {elapsed_sec:.1f} / {self.required_validation_sec:.1f} sn"
+                    self.get_logger().info(log_msg)
+                    print(log_msg, flush=True)
+                    self.last_progress_log_time = now_mono
 
-            self.get_logger().info(
-                f"[TARGET CONFIRMED] Requested={self.target_color} | Detected={detected_color} | "
-                f"Final={final_score:.2f} | YOLO={yolo_conf:.2f} | OpenCV={opencv_conf:.2f} | "
-                f"Angle={target_angle_deg:.1f}° | History={match_count}/{self.window_size}"
-            )
-            self.publish_result(
-                pub_stamp, target_confirmed, self.target_color, detected_color, final_score,
-                yolo_conf, opencv_conf, cx, cy, target_angle_deg, bbox, match_count
-            )
-        else:
-            det_color = best_candidate["detected_color"] if best_candidate is not None else "UNKNOWN"
-            self.publish_result(
-                pub_stamp, False, self.target_color, det_color, 0.0, 0.0, 0.0, 0, 0, 0.0, {}, match_count
-            )
+        final_score = best_candidate["final_score"]
+        yolo_conf = best_candidate["yolo_conf"]
+        opencv_conf = best_candidate["opencv_conf"]
+        cx = best_candidate["center"]["x"]
+        cy = best_candidate["center"]["y"]
+        bbox = best_candidate["bbox"]
+        detected_color = best_candidate["detected_color"]
+
+        target_angle_deg = self.calculate_target_angle(cx)
+
+        self.publish_result(
+            pub_stamp, confirmed, start_target_color, detected_color, final_score,
+            yolo_conf, opencv_conf, cx, cy, target_angle_deg, bbox, elapsed_sec
+        )
 
     # =========================================================================
     # Helper Functions
@@ -554,13 +697,11 @@ class Parkur3TargetNode(Node):
                 mask = cv2.inRange(roi_hsv, b_low, b_high)
 
             else:
-                # Unknown target color -> return fail safe 0.0, False
                 return 0.0, False
 
             matching_pixels = cv2.countNonZero(mask)
             color_ratio = matching_pixels / float(total_pixels)
 
-            # Normalize ratio (30% pixel match in ROI considered full 1.0 confidence)
             normalized_conf = min(1.0, color_ratio / 0.30)
             passed_gate = (color_ratio >= self.opencv_color_gate)
 
@@ -573,8 +714,6 @@ class Parkur3TargetNode(Node):
         """
         Calculates horizontal offset angle relative to camera optical axis.
         Negative = Left, 0 = Center, Positive = Right.
-        If camera_fx_px > 0, uses pinhole camera model.
-        Otherwise falls back to FOV-based linear calculation.
         """
         try:
             camera_center_x = self.camera_width_px / 2.0
@@ -596,7 +735,7 @@ class Parkur3TargetNode(Node):
         self, stamp_float: float, confirmed: bool, target_color: str,
         detected_color: str, final_score: float, yolo_conf: float,
         opencv_conf: float, cx: int, cy: int, angle_deg: float,
-        bbox: dict, history_matches: int = 0
+        bbox: dict, elapsed_sec: float = 0.0
     ):
         """Publishes validated target JSON payload to /albatros/parkur3/target_confirmed."""
         payload = {
@@ -610,8 +749,8 @@ class Parkur3TargetNode(Node):
             "center": {"x": int(cx), "y": int(cy)},
             "target_angle_deg": float(angle_deg),
             "bbox": bbox,
-            "history_matches": int(history_matches),
-            "window_size": self.window_size
+            "validation_elapsed_sec": round(float(elapsed_sec), 2),
+            "required_validation_sec": self.required_validation_sec
         }
         msg = String()
         msg.data = json.dumps(payload, ensure_ascii=False)
