@@ -106,6 +106,19 @@ class MissionNode(Node):
         self.target_reached = False
         self.current_parkur = MissionStatus.PARKUR_UNKNOWN
 
+        # --- Parkur 3 Gate ---
+        # P3 SADECE Pixhawk'ın /mavros/mission/reached üzerinden
+        # gate_wp = (parkur_3_start_wp - 1) bildirmesiyle açılır.
+        # Sadece active_waypoint seq değeri yeterli değildir.
+        # GPS mesafesiyle de P3 açılamaz.
+        self.gate_wp = max(0, self.parkur_3_start_wp - 1)
+        self.p3_gate_opened = False  # Yalnızca waypoint_reached_callback tarafından True yapılır
+        self.get_logger().info(
+            f"[MISSION] P3 gate_wp={self.gate_wp} "
+            f"(parkur_3_start_wp={self.parkur_3_start_wp}-1). "
+            f"P3 yalnızca Pixhawk WaypointReached mesajıyla açılır."
+        )
+
         # Parkur 3 Sub-state tracking
         # Wiper scan sequence relative to reference yaw
         self.scan_angles_deg = [-35.0, -20.0, 0.0, 20.0, 35.0, 20.0, 0.0, -20.0]
@@ -283,7 +296,24 @@ class MissionNode(Node):
         self.update_active_target(msg.current_seq)
 
     def waypoint_reached_callback(self, msg: WaypointReached):
+        """Pixhawk'tan gelen WaypointReached mesajını işler.
+
+        Parkur 3 gate'i YALNIZCA bu callback tarafından açılabilir.
+        gate_wp reached bildirildiğinde p3_gate_opened = True yapılır.
+        GPS mesafesiyle veya active_waypoint seq kontrolüyle P3 açılamaz.
+        """
         wp_seq = int(msg.wp_seq)
+
+        # --- P3 Gate Kontrolü ---
+        # gate_wp = parkur_3_start_wp - 1 (örn. WP6)
+        # Pixhawk bu waypoint'i gerçekten reached bildirdiğinde P3 açılır.
+        if wp_seq == self.gate_wp and not self.p3_gate_opened:
+            self.p3_gate_opened = True
+            self.get_logger().info(
+                f"[PARKUR 3] Gate açıldı! Pixhawk WP{wp_seq} reached bildirdi. "
+                f"P3 navigasyonu etkinleşiyor."
+            )
+
         if self.active_waypoint is None:
             return
 
@@ -387,11 +417,11 @@ class MissionNode(Node):
                     self.active_waypoint['longitude']
                 )
 
-                # NOT: AUTO modda waypoint varışı Pixhawk'ın WaypointReached
-                # mesajıyla (waypoint_reached_callback) belirlenir.
-                # GPS tabanlı check_gps_reached ek güvenlik olarak korunur
-                # ama asıl tetikleyici WaypointReached callback'idir.
-                self.check_gps_reached()
+                # Waypoint ilerlemesi yalnızca Pixhawk /mavros/mission/reached
+                # callback'i üzerinden yapılır (waypoint_reached_callback).
+                # GPS mesafesi bilgi amaçlı hesaplanmaya devam eder fakat
+                # confirm_waypoint_reached() bu noktada HİÇBİR ZAMAN çağrılmaz.
+                # check_gps_reached() devre dışı — yarışma güvenlik kuralı.
 
         self.current_parkur = self.determine_current_parkur()
 
@@ -449,14 +479,16 @@ class MissionNode(Node):
             target_heading = (self.current_yaw_deg + self.p3_target_angle_deg + 360.0) % 360.0
             self.target_bearing = target_heading
 
-            # Check if touch distance reached
-            if self.distance_to_target <= self.touch_distance_threshold_m:
-                self.parkur3_substate = "TOUCH"
-                self.get_logger().info("[PARKUR 3] Target reached! Transitioning APPROACH -> TOUCH")
+            # TOUCH geçişi: GPS waypoint mesafesi kullanılmaz.
+            # Gerçek görsel mesafe ölçümü mevcut olmadığından TOUCH'a otomatik
+            # geçiş yapılmaz; APPROACH davranışı (hedefe yönelik düşük hız) sürdürülür.
+            # İleride parkur3_target_node görsel mesafe sağladığında bu blok aktif edilir.
+            # if visual_distance_to_target <= self.touch_distance_threshold_m:
+            #     self.parkur3_substate = "TOUCH"
+            #     self.get_logger().info("[PARKUR 3] Target reached! Transitioning APPROACH -> TOUCH")
 
         elif self.parkur3_substate == "TOUCH":
             self.mission_state = "PARKUR3_TOUCH"
-            self.confirm_waypoint_reached(self.active_waypoint['seq'] if self.active_waypoint else 7)
 
     def update_state_machine(self):
         if self.mission_state == "COMPLETED":
@@ -488,7 +520,27 @@ class MissionNode(Node):
         self.mission_active = True
 
     def check_gps_reached(self):
+        """GPS mesafesiyle waypoint reached kontrolü.
+
+        NOT: Bu fonksiyon yalnızca Parkur 1 ve Parkur 2 için ek güvenlik
+        mekanizması olarak çalışır.
+        - Parkur 3'te (p3_gate_opened=True) GPS reached hiçbir zaman
+          çağrılmaz (main_loop bunu zaten P3'te çağırmaz).
+        - gate_wp'ye (parkur_3_start_wp - 1) GPS mesafesiyle reached
+          yapılamaz; P3 gate yalnızca waypoint_reached_callback açar.
+        """
         if self.active_waypoint is None:
+            return
+
+        # P3 gate_wp'ye GPS mesafesiyle P3 açılmasını engelle:
+        # gate_wp'e GPS reached gelirse sadece normal waypoint ilerlemesi
+        # yapılır, p3_gate_opened=True yapılmaz.
+        active_seq = self.active_waypoint['seq']
+
+        # Parkur 3 gate açıkken GPS reached devre dışı
+        if self.p3_gate_opened:
+            self.reached_samples_counter = 0
+            self.target_reached = False
             return
 
         if self.distance_to_target <= self.waypoint_reached_radius_m:
@@ -496,7 +548,7 @@ class MissionNode(Node):
             self.target_reached = True
 
             if self.reached_samples_counter >= self.required_reached_samples:
-                seq = self.active_waypoint['seq']
+                seq = active_seq
                 self.last_reached_seq = seq
                 self.confirm_waypoint_reached(seq)
         else:
@@ -538,6 +590,13 @@ class MissionNode(Node):
             self.current_parkur = MissionStatus.PARKUR_COMPLETE
 
     def determine_current_parkur(self) -> int:
+        """Mevcut parkur'u belirler.
+
+        Parkur 3 YALNIZCA p3_gate_opened=True olduğunda aktif olur.
+        p3_gate_opened yalnızca waypoint_reached_callback tarafından
+        gate_wp (parkur_3_start_wp - 1) reached bildirildiğinde True yapılır.
+        Sadece active_waypoint seq >= parkur_3_start_wp olması yeterli değildir.
+        """
         if self.mission_completed:
             return MissionStatus.PARKUR_COMPLETE
 
@@ -546,9 +605,12 @@ class MissionNode(Node):
 
         seq = self.active_waypoint['seq']
 
-        if seq >= self.parkur_3_start_wp:
+        # P3: Yalnızca Pixhawk gate_wp reached bildirdiyse
+        if self.p3_gate_opened:
             return MissionStatus.PARKUR_3
-        elif seq >= self.parkur_2_start_wp:
+
+        # P3 henüz açılmadı: seq >= parkur_3_start_wp olsa bile P2 olarak say
+        if seq >= self.parkur_2_start_wp:
             return MissionStatus.PARKUR_2
         elif seq >= self.parkur_1_start_wp:
             return MissionStatus.PARKUR_1

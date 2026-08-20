@@ -390,9 +390,18 @@ class ControlNode(Node):
         self.request_arm(bool(msg.data))
 
     def mode_command_callback(self, msg: String):
+        """Dışardan gelen mod isteği callback'i.
+
+        /albatros/command/mode topic'inden gelen AUTO veya GUIDED istekklerini
+        işler ve desired_mode'u da günceller.
+        """
         requested_mode = msg.data.strip().upper()
 
         if requested_mode:
+            self.desired_mode = requested_mode
+            self.get_logger().info(
+                f'[MOD] Dıştan mod isteği: {requested_mode} → desired_mode güncellendi.'
+            )
             self.request_mode(requested_mode)
 
     def emergency_stop_callback(self, msg: Bool):
@@ -416,7 +425,12 @@ class ControlNode(Node):
         """Engel tespit sinyali callback'i.
 
         komut_node tarafından yayınlanır. True = önde engel var.
-        Hibrit mod geçişini tetikler.
+
+        NOT: AUTO mod ↔ GUIDED mod geçişi bu callback'te YAPILMAZ.
+        P1 ve P2'de araç her zaman AUTO modda kalır.
+        Engel bilgisi yalnızca loglama için kaydedilir.
+        P3 mod geçişi mission_node'un gate açılımından sonra
+        /albatros/command/mode üzerinden yapılır.
         """
         new_state = bool(msg.data)
 
@@ -424,14 +438,12 @@ class ControlNode(Node):
             self.obstacle_active = new_state
 
             if new_state:
-                self.get_logger().warn(
-                    '[MOD GEÇİŞ] Engel tespit edildi! '
-                    'GUIDED moda geçiş isteniyor.'
+                self.get_logger().debug(
+                    '[ENGEL] Önde engel tespit edildi (mod geçişi yapilmiyor — AUTO devam).'
                 )
             else:
-                self.get_logger().info(
-                    '[MOD GEÇİŞ] Engel aşıldı. '
-                    'AUTO moda geri dönüş isteniyor.'
+                self.get_logger().debug(
+                    '[ENGEL] Engel aşıldı.'
                 )
 
     def control_callback(self):
@@ -439,16 +451,19 @@ class ControlNode(Node):
         if self.auto_obstacle_switching:
             self.manage_mode_switching()
 
+        # Velocity setpoint YALNIZCA araç modu GUIDED olduğunda yayınlanır.
+        # AUTO, MANUAL, HOLD, UNKNOWN veya diğer modlarda Pixhawk'a
+        # setpoint gönderilmez; kontrol tamamen Pixhawk'ta kalır.
+        current_mode = self.mode.upper()
+        if current_mode != 'GUIDED':
+            return
+
+        # GUIDED modda kontrol izni kontrolü
         if not self.control_allowed():
             self.publish_stop()
             return
 
-        # AUTO modda velocity yayını yapma —
-        # Pixhawk kendi L1 navigasyonunu kullanıyor.
-        if self.mode.upper() == 'AUTO':
-            return
-
-        # GUIDED modda (engel kaçınma aktif) — velocity komutu ilet
+        # GUIDED + control_allowed → velocity komutunu MAVROS'a ilet
         command = TwistStamped()
 
         command.header.stamp = (
@@ -486,38 +501,14 @@ class ControlNode(Node):
     def manage_mode_switching(self):
         """Engel durumuna göre AUTO ↔ GUIDED mod geçişini yönetir.
 
-        Kurallar:
-          - obstacle_active = True  → GUIDED moda geç (hemen)
-          - obstacle_active = False → AUTO moda dön (cooldown sonrası)
-          - Cooldown süresi: mode_switch_cooldown_sec
-          - Manuel mod değişikliklerini engelleme
+        NOT: auto_mode_obstacle_switching parametresi True olsa bile
+        engel algılaması artık otomatik mod geçişi yapmıyor.
+        P1 ve P2'de araç her zaman AUTO modda kalır.
+        P3 mod geçişi /albatros/command/mode topic'i üzerinden
+        mission_node tarafından kontrolüne bırakılır.
+        Bu fonksiyon hiçbir mod değişimi yapmaz.
         """
-        now = time.monotonic()
-        current_mode = self.mode.upper()
-
-        if self.obstacle_active:
-            # Engel var → GUIDED moda geç (acil, cooldown yok)
-            if current_mode != 'GUIDED':
-                self.desired_mode = 'GUIDED'
-                self.request_mode('GUIDED')
-                self.last_mode_switch_time = now
-                self.get_logger().warn(
-                    '[MOD GEÇİŞ] AUTO → GUIDED '
-                    '(engel kaçınma aktif)'
-                )
-        else:
-            # Engel yok → AUTO moda geri dön (cooldown ile)
-            if current_mode == 'GUIDED' and self.desired_mode != 'GUIDED':
-                time_since_switch = now - self.last_mode_switch_time
-
-                if time_since_switch >= self.mode_switch_cooldown:
-                    self.desired_mode = 'AUTO'
-                    self.request_mode('AUTO')
-                    self.last_mode_switch_time = now
-                    self.get_logger().info(
-                        '[MOD GEÇİŞ] GUIDED → AUTO '
-                        '(engel aşıldı, normal seyir)'
-                    )
+        pass  # Otomatik mod geçişi devre dışı
 
     def control_allowed(self):
         if self.emergency_stop:

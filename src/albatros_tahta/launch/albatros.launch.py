@@ -276,9 +276,14 @@ def generate_launch_description():
             'require_gps': True,
             'require_imu': True,
             # Hibrit AUTO/GUIDED mod geçiş parametreleri
+            # NOT: auto_mode_obstacle_switching=False olarak ayarlandı.
+            # P1 ve P2'de araç her zaman AUTO modda kalır.
+            # Engel algılaması GUIDED geçişini tetiklemez.
+            # P3 mod geçişi yalnızca mission_node'un gate açılımından sonra
+            # /albatros/command/mode topic'i üzerinden gerçekleşir.
             'default_mode': 'AUTO',
             'mode_switch_cooldown_sec': 2.0,
-            'auto_mode_obstacle_switching': True,
+            'auto_mode_obstacle_switching': False,
         }],
     )
 

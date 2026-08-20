@@ -57,6 +57,7 @@ COSTMAP_VALID_TOPIC  = '/albatros/costmap/valid'
 CMD_VEL_TOPIC        = '/albatros/command/cmd_vel'
 KOMUT_STATUS_TOPIC   = '/albatros/komut/status'
 OBSTACLE_DETECTED_TOPIC = '/albatros/obstacle/detected'
+MODE_COMMAND_TOPIC   = '/albatros/command/mode'  # P3 gate açılınca GUIDED isteği
 
 # Varsayılan parametreler
 DEFAULT_PUBLISH_RATE       = 10.0   # Hz
@@ -192,6 +193,10 @@ class KomutNode(Node):
         # ─── Engel Tespit Durumu ─────────────────────────────────────
         self._obstacle_detected = False
 
+        # ─── P3 GUIDED İstek Durumu ──────────────────────────────────
+        # Rate limit: en az 1 saniyede bir GUIDED isteği gönder (spam önleme)
+        self._p3_guided_last_request_time = 0.0
+
         # ─── QoS ────────────────────────────────────────────────────────
         default_qos = QoSProfile(depth=10)
 
@@ -222,6 +227,11 @@ class KomutNode(Node):
 
         self._pub_obstacle = self.create_publisher(
             Bool, OBSTACLE_DETECTED_TOPIC, default_qos,
+        )
+
+        # P3 gate açılınca GUIDED isteği göndermek için
+        self._pub_mode_cmd = self.create_publisher(
+            String, MODE_COMMAND_TOPIC, default_qos,
         )
 
         # ─── Timer ──────────────────────────────────────────────────────
@@ -275,8 +285,12 @@ class KomutNode(Node):
         Akış:
           1. Güvenlik ve veri kontrolleri
           2. Engel tespit kontrolü → /albatros/obstacle/detected yayınla
-          3. AUTO modda → sadece izle, cmd_vel üretme
-          4. GUIDED modda → P1 veya P2 navigasyon → Hız komutu
+          3. Parkur tespiti (MOD KONTROLÜNDEN ÖNCE yapılmalı)
+          4a. P1/P2 + AUTO → Pixhawk navigasyonu, cmd_vel üretme, return
+          4b. P3 + AUTO  → rate-limited GUIDED isteği yayınla, cmd_vel üretme
+          4c. P3 + GUIDED → _navigate_parkur3() çalıştır, cmd_vel yayınla
+          4d. P3 + diğer mod (MANUAL/HOLD) → cmd_vel üretme, bekleme
+          4e. P1/P2 + GUIDED/diğer → cmd_vel üretme (sadece GUIDED + P komutlarına izin)
         """
 
         # ── Adım 1: Güvenlik kontrolü ───────────────────────────────────
@@ -308,39 +322,166 @@ class KomutNode(Node):
         else:
             self._publish_obstacle(False)
 
-        # ── Adım 4: Mod kontrolü — AUTO'dayken cmd_vel üretme ─────
+        # ── Adım 4: Parkur tespiti — MOD kontrolünden ÖNCE yapılır ─
+        # Bu sıralama kritiktir: P3+AUTO kombinasyonu doğru yakalanabilsin.
+        current_parkur = self._state.current_parkur
         current_mode = self._state.mode.upper() if hasattr(self._state, 'mode') else 'UNKNOWN'
 
-        if current_mode == 'AUTO':
-            # AUTO modda Pixhawk kendi navigasyonunu yapıyor.
-            # Sadece engel izleme aktif, motor komutu üretilmez.
+        # ── Adım 5: Parkur ve moda göre karar ──────────────────────
+
+        if current_parkur == 3:
+            # ─ P3 ─────────────────────────────────────────────────
+            if current_mode == 'AUTO':
+                # P3 gate açıldı ama Pixhawk henüz AUTO'da.
+                # Rate-limited GUIDED isteği gönder (spam önleme: 1 Hz).
+                now = time.monotonic()
+                if now - self._p3_guided_last_request_time >= 1.0:
+                    self._p3_guided_last_request_time = now
+                    mode_msg = String()
+                    mode_msg.data = 'GUIDED'
+                    self._pub_mode_cmd.publish(mode_msg)
+                    self.get_logger().info(
+                        '[P3] AUTO modda, GUIDED isteği gönderildi. '
+                        'VehicleState GUIDED olana kadar cmd_vel yok.'
+                    )
+                # Bu döngüde cmd_vel üretme, bekle
+                self._publish_status(
+                    active=False,
+                    reason='P3_GUIDED_BEKLENIYOR',
+                    linear=0.0,
+                    angular=0.0,
+                )
+                return
+
+            elif current_mode == 'GUIDED':
+                # P3 + GUIDED: hedef navigasyonu çalıştır
+                cmd = self._navigate_parkur3()
+                if cmd is not None:
+                    self._pub_cmd_vel.publish(cmd)
+                    self._total_commands += 1
+                self._publish_status(
+                    active=True,
+                    reason='P3_NAVIGASYON',
+                    linear=cmd.linear.x if cmd else 0.0,
+                    angular=cmd.angular.z if cmd else 0.0,
+                )
+                return
+
+            else:
+                # P3 + MANUAL / HOLD / UNKNOWN vb.
+                # Operatör kontrolünü zorla değiştirme, cmd_vel üretme.
+                self._publish_status(
+                    active=False,
+                    reason=f'P3_MOD_YANLIS_{current_mode}',
+                    linear=0.0,
+                    angular=0.0,
+                )
+                return
+
+        elif current_parkur in (1, 2):
+            # ─ P1 / P2 ───────────────────────────────────────────────────
+            # P1 ve P2'de HİÇBİR KOŞULDA cmd_vel üretilmez.
+            # Pixhawk/QGroundControl AUTO mission navigasyonu yürütür.
+            # GUIDED, MANUAL, HOLD veya diğer modlarda da sürüş komutu
+            # üretilmez; operatör/Pixhawk kontrolüne müdahale edilmez.
             self._publish_status(
                 active=False,
-                reason='AUTO_MOD_IZLEME',
+                reason=f'P{current_parkur}_AUTO_PIXHAWK_{current_mode}',
                 linear=0.0,
                 angular=0.0,
             )
             return
 
-        # ── Adım 5: GUIDED modda → Parkur tespiti ve navigasyon ────
-        current_parkur = self._state.current_parkur
-
-        if current_parkur == 1:
-            cmd = self._navigate_parkur1()
         else:
-            cmd = self._navigate_parkur2()
+            # Bilinmeyen parkur — cmd_vel üretme
+            self._publish_status(
+                active=False,
+                reason=f'PARKUR_BILINMIYOR_{current_parkur}',
+            )
+            return
 
-        # ── Adım 6: Hız komutu yayınlama ────────────────────────────────
-        if cmd is not None:
-            self._pub_cmd_vel.publish(cmd)
-            self._total_commands += 1
+    # ═════════════════════════════════════════════════════════════════════
+    # Parkur 3 — Hedef Takip Navigasyonu (SCAN / APPROACH)
+    # ═════════════════════════════════════════════════════════════════════
 
-        self._publish_status(
-            active=True,
-            reason=f'P{current_parkur}_NAVIGASYON',
-            linear=cmd.linear.x if cmd else 0.0,
-            angular=cmd.angular.z if cmd else 0.0,
+    def _navigate_parkur3(self) -> Twist:
+        """
+        Parkur 3: GUIDED modda hedef arama ve yaklaşma navigasyonu.
+
+        mission_node'un yayınladığı mission_state (PARKUR3_SCAN,
+        PARKUR3_APPROACH, PARKUR3_TOUCH) ve target_bearing_deg
+        (heading_error_deg aracılığıyla state_node üzerinden gelir)
+        kullanılır.
+
+        SCAN  : linear.x = 0 (ileri gitme, sadece dön)
+        APPROACH: hedef açısına dön + düşük güvenli hızla ileri git
+        Hedef kaybolursa (mission_state = PARKUR3_SCAN) ileri gitme.
+        Bilinmeyen alt-durum: sıfır hız (güvenli).
+        """
+        cmd = Twist()
+
+        # mission_state state_node üzerinden VehicleState'e taşınmıyorsa
+        # heading_error_deg p3 target_bearing'ini temsil eder (state_node yapar).
+        err_deg = self._state.heading_error_deg if self._state else 0.0
+
+        # mission_state'i al (VehicleState'te varsa; yoksa güvenli varsayım)
+        mission_state = ''
+        if self._state and hasattr(self._state, 'mission_state'):
+            mission_state = str(self._state.mission_state).upper()
+
+        # Deadband ve EMA filtre (P1 ile aynı)
+        if abs(err_deg) < self._heading_deadband:
+            err_deg = 0.0
+        self._filtered_heading_error = (
+            self._heading_alpha * err_deg
+            + (1.0 - self._heading_alpha) * self._filtered_heading_error
         )
+        err_deg = self._filtered_heading_error
+
+        err_rad = math.radians(err_deg)
+        angular_z = self._steering_kp * err_rad
+        angular_z = clamp(angular_z, -self._max_angular, self._max_angular)
+        cmd.angular.z = -angular_z  # heading_error → ArduRover konvansiyonu
+
+        if mission_state == 'PARKUR3_SCAN':
+            # SCAN: sadece dön, ileri gitme
+            cmd.linear.x = 0.0
+            self.get_logger().debug('[P3 SCAN] linear=0, sadece dönüyor.')
+
+        elif mission_state == 'PARKUR3_APPROACH':
+            # APPROACH: düşük sabit hızla ileri git
+            # Maksimum hız limiti: güvenli düşük değer (max_linear_speed'in %30'u)
+            p3_max_speed = min(0.4, self._max_linear * 0.30)
+            p3_min_speed = min(0.15, self._min_linear)
+
+            # Büyük açı hatasında yavaşla
+            abs_error = abs(err_deg)
+            if abs_error <= 15.0:
+                turn_factor = 1.0
+            elif abs_error >= 90.0:
+                turn_factor = 0.1
+            else:
+                turn_factor = 1.0 - 0.9 * ((abs_error - 15.0) / 75.0)
+
+            cmd.linear.x = p3_min_speed + (p3_max_speed - p3_min_speed) * turn_factor
+            self.get_logger().debug(f'[P3 APPROACH] linear={cmd.linear.x:.2f}, angular={cmd.angular.z:.2f}')
+
+        elif mission_state == 'PARKUR3_TOUCH':
+            # TOUCH: dur
+            cmd.linear.x = 0.0
+            cmd.angular.z = 0.0
+            self.get_logger().debug('[P3 TOUCH] Duruluyor.')
+
+        else:
+            # Bilinmeyen P3 alt-durumu veya mission_state boş:
+            # Güvenli: ileri gitme
+            cmd.linear.x = 0.0
+            cmd.angular.z = 0.0
+            self.get_logger().debug(
+                f'[P3] Bilinmeyen mission_state="{mission_state}", sıfır hız.'
+            )
+
+        return cmd
 
     # ═════════════════════════════════════════════════════════════════════
     # Parkur 1 — Saf PID Waypoint Takibi
