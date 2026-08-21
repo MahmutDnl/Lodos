@@ -14,6 +14,8 @@ setup(
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'),
             glob(os.path.join('launch', '*.launch.py'))),
+        (os.path.join('share', package_name, 'models'),
+            glob(os.path.join('models', '*.hef'))),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
@@ -25,7 +27,7 @@ setup(
     entry_points={
         'console_scripts': [
             'camera_node = albatros_simple.camera_node:main',
-            'hybrid_vision_node = albatros_simple.hybrid_vision_node:main',
+            'yolo_node = albatros_simple.yolo_node:main',
             'mission_node = albatros_simple.mission_node:main',
         ],
     },

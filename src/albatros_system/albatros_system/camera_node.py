@@ -1,76 +1,79 @@
 #!/usr/bin/env python3
 
+import cv2
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
-import cv2
-import numpy as np
+from cv_bridge import CvBridge
 
 
 class CameraNode(Node):
     def __init__(self):
         super().__init__('camera_node')
 
+        # ROS2 Parametreleri Tanımlama
         self.declare_parameter('camera_index', 0)
-        self.declare_parameter('frame_width', 640)
-        self.declare_parameter('frame_height', 480)
-        self.declare_parameter('fps', 30.0)
+        self.declare_parameter('width', 640)
+        self.declare_parameter('height', 480)
+        self.declare_parameter('fps', 20)
 
-        self.camera_index = self.get_parameter('camera_index').value
-        self.frame_width = self.get_parameter('frame_width').value
-        self.frame_height = self.get_parameter('frame_height').value
-        self.fps = self.get_parameter('fps').value
+        # Parametre Değerlerini Alma
+        self.camera_index = int(self.get_parameter('camera_index').value)
+        self.width = int(self.get_parameter('width').value)
+        self.height = int(self.get_parameter('height').value)
+        self.fps = int(self.get_parameter('fps').value)
 
-        self.publisher_ = self.create_publisher(Image, '/albatros/kamera/image_raw', 10)
+        # CvBridge & Publisher Kurulumu
+        self.bridge = CvBridge()
+        self.publisher_ = self.create_publisher(
+            Image,
+            '/albatros/camera/image_raw',
+            qos_profile_sensor_data
+        )
 
+        # Kamera Başlatma
         self.cap = cv2.VideoCapture(self.camera_index)
-
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.frame_width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.frame_height)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
         self.cap.set(cv2.CAP_PROP_FPS, self.fps)
 
         if not self.cap.isOpened():
-            self.get_logger().error('Kamera açılamadı.')
+            self.get_logger().error(f'Kamera açılamadı! Kamera Index: {self.camera_index}')
         else:
-            self.get_logger().info('Kamera başarıyla açıldı.')
+            actual_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            actual_fps = self.cap.get(cv2.CAP_PROP_FPS)
             self.get_logger().info(
-                f'Kamera ayarları: {self.frame_width}x{self.frame_height} @ {self.fps} FPS'
+                f'Kamera başarıyla açıldı. Gerçek Çözünürlük: {actual_width}x{actual_height}, FPS: {actual_fps}'
             )
 
-        timer_period = 1.0 / self.fps
+        # Timer Kurulumu
+        timer_period = 1.0 / self.fps if self.fps > 0 else 0.05
         self.timer = self.create_timer(timer_period, self.publish_frame)
 
     def publish_frame(self):
+        if not self.cap.isOpened():
+            return
+
         ret, frame = self.cap.read()
+        if not ret or frame is None:
+            self.get_logger().warn('Kameradan tek bir frame okunamadı, işlem atlanıyor.')
+            return
 
-        if ret:
-            
-            #frame = cv2.flip(frame, 1)   #sağ-sol ters görüntü için ekledim.
-
-            if len(frame.shape) == 2:
-                frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
-            elif len(frame.shape) == 3 and frame.shape[2] == 4:
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-            
-            if frame.dtype != 'uint8':
-                frame = frame.astype(np.uint8)
-
-            image_msg = Image()
+        # Frame'e ROS timestamp ekleme ve yayınlama
+        try:
+            image_msg = self.bridge.cv2_to_imgmsg(frame, encoding='bgr8')
             image_msg.header.stamp = self.get_clock().now().to_msg()
             image_msg.header.frame_id = 'camera_frame'
-            image_msg.height = frame.shape[0]
-            image_msg.width = frame.shape[1]
-            image_msg.encoding = 'bgr8'
-            image_msg.is_bigendian = False
-            image_msg.step = frame.shape[1] * 3
-            image_msg.data = frame.tobytes()
-
             self.publisher_.publish(image_msg)
-        else:
-            self.get_logger().warn('Kameradan görüntü alınamadı.')
+        except Exception as e:
+            self.get_logger().error(f'Görüntü dönüştürülürken/yayınlanırken hata: {str(e)}')
 
     def destroy_node(self):
-        self.cap.release()
+        if hasattr(self, 'cap') and self.cap.isOpened():
+            self.cap.release()
+            self.get_logger().info('Kamera serbest bırakıldı (released).')
         super().destroy_node()
 
 

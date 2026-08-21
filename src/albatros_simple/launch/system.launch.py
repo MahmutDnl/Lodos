@@ -13,8 +13,8 @@ def generate_launch_description():
         ),
         Node(
             package='albatros_simple',
-            executable='hybrid_vision_node',
-            name='hybrid_vision_node',
+            executable='yolo_node',
+            name='yolo_node',
             output='screen',
         ),
         Node(

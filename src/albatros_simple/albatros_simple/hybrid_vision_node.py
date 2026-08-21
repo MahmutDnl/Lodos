@@ -13,7 +13,7 @@ class HybridVisionNode(Node):
 
     def __init__(self):
         super().__init__('hybrid_vision_node')
-        self.get_logger().info('HybridVisionNode başlatıldı (iskelet modunda çalışıyor).')
+        self.get_logger().info('HybridVisionNode (yolo_node.py ile değiştirildi, Parkur 3 YOLO aktif).')
         
         # Periyodik log basımı (isteğe bağlı placeholder gösterim)
         self.timer = self.create_timer(5.0, self.timer_callback)
