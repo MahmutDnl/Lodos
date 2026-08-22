@@ -23,4 +23,10 @@ def generate_launch_description():
             name='mission_node',
             output='screen',
         ),
+        Node(
+            package='albatros_simple',
+            executable='parkur_gecis_node',
+            name='parkur_gecis_node',
+            output='screen',
+        ),
     ])

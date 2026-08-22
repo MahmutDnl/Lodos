@@ -27,7 +27,7 @@ from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 
 try:
     from ament_index_python.packages import get_package_share_directory
@@ -125,6 +125,14 @@ class YoloNode(Node):
         self.init_hailo()
 
         # ─── Publisher ve Subscriber'lar ─────────────────────────────────────
+        self.parkur3_active = False
+        self.parkur3_sub = self.create_subscription(
+            Bool,
+            "/albatros/parkur3_active",
+            self.parkur3_active_callback,
+            10
+        )
+
         self.processed_image_pub = self.create_publisher(Image, self.processed_image_topic, 10)
         self.detections_pub = self.create_publisher(String, self.detections_topic, 10)
 
@@ -134,6 +142,11 @@ class YoloNode(Node):
             self.image_callback,
             qos_profile_sensor_data
         )
+
+    def parkur3_active_callback(self, msg: Bool):
+        if msg.data and not self.parkur3_active:
+            self.get_logger().info("[yolo_node] Parkur-3 sinyali alındı! YOLO tespiti aktif duruma geçti.")
+        self.parkur3_active = msg.data
 
         # Worker Thread
         self.worker_thread = threading.Thread(target=self.inference_worker, daemon=True)
@@ -302,6 +315,11 @@ class YoloNode(Node):
     def inference_worker(self):
         """Arka planda görüntüyü işleyen ve inference koşturan worker döngüsü."""
         while self.running and rclpy.ok():
+            if not self.parkur3_active:
+                self.get_logger().info("[yolo_node] Parkur-3 aktif sinyali bekleniyor...", throttle_duration_sec=10.0)
+                self.frame_event.wait(timeout=0.5)
+                continue
+
             if not self.frame_event.wait(timeout=0.1):
                 continue
             self.frame_event.clear()

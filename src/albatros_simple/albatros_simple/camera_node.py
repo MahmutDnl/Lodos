@@ -5,6 +5,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
+from std_msgs.msg import Bool
 from cv_bridge import CvBridge
 
 
@@ -23,6 +24,15 @@ class CameraNode(Node):
         self.width = int(self.get_parameter('width').value)
         self.height = int(self.get_parameter('height').value)
         self.fps = int(self.get_parameter('fps').value)
+
+        # Parkur-3 Aktiflik Durumu
+        self.parkur3_active = False
+        self.parkur3_sub = self.create_subscription(
+            Bool,
+            '/albatros/parkur3_active',
+            self.parkur3_active_callback,
+            10
+        )
 
         # CvBridge ve Publisher Kurulumu
         self.bridge = CvBridge()
@@ -52,7 +62,16 @@ class CameraNode(Node):
         timer_period = 1.0 / self.fps if self.fps > 0 else 0.05
         self.timer = self.create_timer(timer_period, self.publish_frame)
 
+    def parkur3_active_callback(self, msg: Bool):
+        if msg.data and not self.parkur3_active:
+            self.get_logger().info('[CameraNode] Parkur-3 sinyali alındı! Kamera yayını aktif duruma geçti.')
+        self.parkur3_active = msg.data
+
     def publish_frame(self):
+        if not self.parkur3_active:
+            self.get_logger().info('[CameraNode] Parkur-3 aktif sinyali bekleniyor...', throttle_duration_sec=10.0)
+            return
+
         if not self.cap.isOpened():
             return
 

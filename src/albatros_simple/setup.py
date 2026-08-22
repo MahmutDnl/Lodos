@@ -29,6 +29,7 @@ setup(
             'camera_node = albatros_simple.camera_node:main',
             'yolo_node = albatros_simple.yolo_node:main',
             'mission_node = albatros_simple.mission_node:main',
+            'parkur_gecis_node = albatros_simple.parkur_gecis_node:main',
         ],
     },
 )
