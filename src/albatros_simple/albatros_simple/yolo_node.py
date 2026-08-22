@@ -143,26 +143,27 @@ class YoloNode(Node):
             qos_profile_sensor_data
         )
 
-    def parkur3_active_callback(self, msg: Bool):
-        if msg.data and not self.parkur3_active:
-            self.get_logger().info("[yolo_node] Parkur-3 sinyali alındı! YOLO tespiti aktif duruma geçti.")
-        self.parkur3_active = msg.data
-
-        # Worker Thread
+        # Worker Thread sadece 1 kez __init__ içinde başlatılır
         self.worker_thread = threading.Thread(target=self.inference_worker, daemon=True)
         self.worker_thread.start()
 
-        self.get_logger().info("==================================================")
-        self.get_logger().info("Parkur 3 YOLO Node Başlatıldı (yolo_node)")
-        self.get_logger().info(f"  Kamera Konusu     : {self.input_image_topic}")
-        self.get_logger().info(f"  Tespit Konusu     : {self.detections_topic}")
-        self.get_logger().info(f"  İşlenmiş Konu     : {self.processed_image_topic}")
-        self.get_logger().info(f"  Model Dosyası     : {self.resolved_model_path}")
-        self.get_logger().info(f"  Confidence Eşiği  : {self.confidence_threshold:.2f}")
-        self.get_logger().info(f"  Min BBox Genişlik : {self.min_bbox_width_px} px")
-        self.get_logger().info(f"  Kamera (fx, cx)   : {self.fx}, {self.cx}")
-        self.get_logger().info(f"  Duba Genişliği    : {self.real_buoy_width} m")
-        self.get_logger().info("==================================================")
+    def parkur3_active_callback(self, msg: Bool):
+        if msg.data and not self.parkur3_active:
+            self.get_logger().info("[yolo_node] Parkur-3 sinyali alındı! YOLO tespiti aktif duruma geçti.")
+            self.get_logger().info("==================================================")
+            self.get_logger().info("Parkur 3 YOLO Node Aktif Edildi (yolo_node)")
+            self.get_logger().info(f"  Kamera Konusu     : {self.input_image_topic}")
+            self.get_logger().info(f"  Tespit Konusu     : {self.detections_topic}")
+            self.get_logger().info(f"  İşlenmiş Konu     : {self.processed_image_topic}")
+            self.get_logger().info(f"  Model Dosyası     : {self.resolved_model_path}")
+            self.get_logger().info(f"  Confidence Eşiği  : {self.confidence_threshold:.2f}")
+            self.get_logger().info(f"  Min BBox Genişlik : {self.min_bbox_width_px} px")
+            self.get_logger().info(f"  Kamera (fx, cx)   : {self.fx}, {self.cx}")
+            self.get_logger().info(f"  Duba Genişliği    : {self.real_buoy_width} m")
+            self.get_logger().info("==================================================")
+        elif not msg.data and self.parkur3_active:
+            self.get_logger().info("[yolo_node] Parkur-3 sinyali pasife düştü.")
+        self.parkur3_active = msg.data
 
     def resolve_model_path(self, raw_path_str: str) -> Path:
         """HEF model dosyasının varlığını paket dizininde ve workspace'te kontrol eder."""
